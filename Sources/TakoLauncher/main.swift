@@ -3901,10 +3901,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showLauncher() {
         capturePreviousFrontmostWindow()
         refreshApplications(force: false)
-        launcherViewController.prepareForPresentation(apps: cachedApps)
+        let actionableCandidateResult = actionableCandidates(from: cachedApps)
+        launcherViewController.prepareForPresentation(apps: actionableCandidateResult.candidates)
         positionWindow()
         AppLog.write("show_launcher", [
-            "candidate_count": cachedApps.count,
+            "candidate_count": actionableCandidateResult.candidates.count,
+            "raw_candidate_count": cachedApps.count,
+            "hidden_noop_candidates": actionableCandidateResult.hiddenCounts,
             "previous_pid": logPID(previousFrontmostProcessIdentifier),
             "previous_title": previousFrontmostWindowTitle ?? "nil"
         ])
@@ -3992,6 +3995,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cachedBookmarks +
             cachedAudioDevices +
             cachedBluetoothDevices
+    }
+
+    private func actionableCandidates(
+        from candidates: [LaunchableApp]
+    ) -> (candidates: [LaunchableApp], hiddenCounts: [String: Int]) {
+        var hiddenCounts: [String: Int] = [:]
+        var actionableCandidates: [LaunchableApp] = []
+
+        for candidate in candidates {
+            if let reason = noopCandidateReason(for: candidate) {
+                hiddenCounts[reason, default: 0] += 1
+            } else {
+                actionableCandidates.append(candidate)
+            }
+        }
+
+        return (actionableCandidates, hiddenCounts)
+    }
+
+    private func noopCandidateReason(for app: LaunchableApp) -> String? {
+        if isCurrentRunningApplication(app) {
+            return "frontmost_running_application"
+        }
+
+        if isCurrentWindow(app) {
+            return "frontmost_window"
+        }
+
+        if isCurrentAudioDevice(app) {
+            return "current_audio_device"
+        }
+
+        return nil
+    }
+
+    private func isCurrentRunningApplication(_ app: LaunchableApp) -> Bool {
+        app.targetKind == .application &&
+            app.isRunning &&
+            app.processIdentifier == previousFrontmostProcessIdentifier
+    }
+
+    private func isCurrentWindow(_ app: LaunchableApp) -> Bool {
+        guard
+            app.targetKind == .window,
+            app.processIdentifier == previousFrontmostProcessIdentifier,
+            let windowTitle = trimmed(app.windowTitle),
+            let previousTitle = trimmed(previousFrontmostWindowTitle)
+        else {
+            return false
+        }
+
+        return normalized(windowTitle) == normalized(previousTitle)
+    }
+
+    private func isCurrentAudioDevice(_ app: LaunchableApp) -> Bool {
+        (app.targetKind == .audioInput || app.targetKind == .audioOutput) &&
+            app.applicationName == "Current"
     }
 
     private func launch(_ app: LaunchableApp) {
@@ -4228,6 +4288,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func logAudioDeviceIdentifier(_ audioDeviceIdentifier: AudioDeviceID?) -> Any {
         audioDeviceIdentifier.map { Int($0) } ?? NSNull()
+    }
+
+    private func trimmed(_ string: String?) -> String? {
+        guard let string else {
+            return nil
+        }
+
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func normalized(_ string: String) -> String {
+        string.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
     }
 }
 
