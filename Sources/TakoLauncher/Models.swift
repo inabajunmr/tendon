@@ -4,6 +4,7 @@ import Foundation
 
 enum AppPreferences {
     private static let includeChromeBookmarksKey = "includeChromeBookmarks"
+    private static let didApplyLaunchAtLoginDefaultKey = "didApplyLaunchAtLoginDefault"
 
     static var includeChromeBookmarks: Bool {
         get {
@@ -15,6 +16,15 @@ enum AppPreferences {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: includeChromeBookmarksKey)
+        }
+    }
+
+    static var didApplyLaunchAtLoginDefault: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: didApplyLaunchAtLoginDefaultKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: didApplyLaunchAtLoginDefaultKey)
         }
     }
 }

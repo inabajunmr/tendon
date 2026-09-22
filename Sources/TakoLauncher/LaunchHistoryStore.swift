@@ -32,19 +32,30 @@ final class LaunchHistoryStore {
     }
 
     func recordLaunch(of app: LaunchableApp) {
-        var entry = entries[app.historyKey] ?? LaunchHistoryEntry(
+        recordUse(historyKey: app.historyKey)
+    }
+
+    func recordUse(historyKey: String) {
+        var entry = entries[historyKey] ?? LaunchHistoryEntry(
             count: 0,
             lastLaunchedAt: .distantPast
         )
 
         entry.count += 1
         entry.lastLaunchedAt = Date()
-        entries[app.historyKey] = entry
+        entries[historyKey] = entry
         save()
     }
 
     func sort(_ apps: [LaunchableApp]) -> [LaunchableApp] {
         apps.sorted { lhs, rhs in
+            let lhsPriority = sortPriority(for: lhs)
+            let rhsPriority = sortPriority(for: rhs)
+
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+
             let lhsEntry = entries[lhs.historyKey]
             let rhsEntry = entries[rhs.historyKey]
             let lhsLastLaunchedAt = lhsEntry?.lastLaunchedAt ?? .distantPast
@@ -62,6 +73,21 @@ final class LaunchHistoryStore {
             }
 
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private func sortPriority(for app: LaunchableApp) -> Int {
+        switch app.targetKind {
+        case .window:
+            return 0
+        case .application,
+             .bookmark,
+             .audioInput,
+             .audioOutput,
+             .webSearch,
+             .bluetoothConnect,
+             .bluetoothDisconnect:
+            return 1
         }
     }
 

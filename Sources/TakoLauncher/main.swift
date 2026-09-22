@@ -5,6 +5,7 @@ import CoreAudio
 import Darwin
 import IOBluetooth
 import IOKit
+import ServiceManagement
 import UniformTypeIdentifiers
 
 private struct CoreGraphicsWindowInfo {
@@ -85,6 +86,73 @@ private enum CoreGraphicsWindowReader {
         }
 
         return WindowFrame(x: x, y: y, width: width, height: height)
+    }
+}
+
+private enum WindowHistoryKey {
+    static func make(appHistoryKey: String, title: String, applicationName: String?) -> String {
+        let normalizedTitle = normalizedWindowTitle(title, applicationName: applicationName)
+        return "window-title:\(appHistoryKey):\(normalizedTitle)"
+    }
+
+    private static func normalizedWindowTitle(_ title: String, applicationName: String?) -> String {
+        let collapsedTitle = collapseWhitespace(title)
+        let strippedTitle = titleByStrippingApplicationSuffix(
+            from: collapsedTitle,
+            applicationName: applicationName
+        )
+
+        return collapseWhitespace(strippedTitle)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+    }
+
+    private static func titleByStrippingApplicationSuffix(
+        from title: String,
+        applicationName: String?
+    ) -> String {
+        for applicationName in applicationNameAliases(for: applicationName) {
+            for separator in [" - ", " — "] {
+                guard
+                    let range = title.range(
+                        of: "\(separator)\(applicationName)",
+                        options: [.caseInsensitive, .diacriticInsensitive]
+                    )
+                else {
+                    continue
+                }
+
+                let prefix = String(title[..<range.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prefix.isEmpty {
+                    return prefix
+                }
+            }
+        }
+
+        return title
+    }
+
+    private static func applicationNameAliases(for applicationName: String?) -> [String] {
+        guard let applicationName = applicationName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !applicationName.isEmpty else {
+            return []
+        }
+
+        var aliases = [applicationName]
+        if applicationName.hasPrefix("Google ") {
+            aliases.append(String(applicationName.dropFirst("Google ".count)))
+        }
+
+        return aliases
+    }
+
+    private static func collapseWhitespace(_ string: String) -> String {
+        string
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 }
 
@@ -588,6 +656,12 @@ enum AppDiscovery {
         frame: WindowFrame?,
         windowIdentifier: UInt32?
     ) -> LaunchableApp {
+        let applicationName = baseApp.applicationName ?? baseApp.name
+        let historyKey = WindowHistoryKey.make(
+            appHistoryKey: baseApp.historyKey,
+            title: title,
+            applicationName: applicationName
+        )
         let searchText = [
             title,
             baseApp.name,
@@ -603,12 +677,12 @@ enum AppDiscovery {
 
         return LaunchableApp(
             name: title,
-            applicationName: baseApp.applicationName ?? baseApp.name,
+            applicationName: applicationName,
             url: baseApp.url,
             bundleIdentifier: baseApp.bundleIdentifier,
             searchText: searchText,
             identityKey: identityKey,
-            historyKey: baseApp.historyKey,
+            historyKey: historyKey,
             processIdentifier: baseApp.processIdentifier,
             isRunning: true,
             targetKind: .window,
@@ -3203,16 +3277,23 @@ final class AppCellView: NSTableCellView {
 
 final class PreferencesViewController: NSViewController {
     var onIncludeChromeBookmarksChanged: ((Bool) -> Void)?
+    var onLaunchAtLoginChanged: ((Bool) -> Void)?
 
     private let includeChromeBookmarksButton = NSButton(
         checkboxWithTitle: "Chrome bookmarks",
         target: nil,
         action: nil
     )
+    private let launchAtLoginButton = NSButton(
+        checkboxWithTitle: "Launch at login",
+        target: nil,
+        action: nil
+    )
 
-    init(includeChromeBookmarks: Bool) {
+    init(includeChromeBookmarks: Bool, launchAtLogin: Bool) {
         super.init(nibName: nil, bundle: nil)
         includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
+        launchAtLoginButton.state = launchAtLogin ? .on : .off
     }
 
     required init?(coder: NSCoder) {
@@ -3220,7 +3301,7 @@ final class PreferencesViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 120))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 174))
     }
 
     override func viewDidLoad() {
@@ -3232,31 +3313,59 @@ final class PreferencesViewController: NSViewController {
         includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
     }
 
+    func setLaunchAtLogin(_ launchAtLogin: Bool) {
+        launchAtLoginButton.state = launchAtLogin ? .on : .off
+    }
+
     private func setup() {
-        let titleLabel = NSTextField(labelWithString: "Sources")
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        let sourcesLabel = sectionLabel("Sources")
+        let startupLabel = sectionLabel("Startup")
 
         includeChromeBookmarksButton.translatesAutoresizingMaskIntoConstraints = false
         includeChromeBookmarksButton.target = self
         includeChromeBookmarksButton.action = #selector(toggleIncludeChromeBookmarks(_:))
 
-        view.addSubview(titleLabel)
+        launchAtLoginButton.translatesAutoresizingMaskIntoConstraints = false
+        launchAtLoginButton.target = self
+        launchAtLoginButton.action = #selector(toggleLaunchAtLogin(_:))
+
+        view.addSubview(sourcesLabel)
         view.addSubview(includeChromeBookmarksButton)
+        view.addSubview(startupLabel)
+        view.addSubview(launchAtLoginButton)
 
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 22),
-            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -22),
-            titleLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
+            sourcesLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 22),
+            sourcesLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -22),
+            sourcesLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
 
-            includeChromeBookmarksButton.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            includeChromeBookmarksButton.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
-            includeChromeBookmarksButton.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 14)
+            includeChromeBookmarksButton.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            includeChromeBookmarksButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
+            includeChromeBookmarksButton.topAnchor.constraint(equalTo: sourcesLabel.bottomAnchor, constant: 14),
+
+            startupLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            startupLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            startupLabel.topAnchor.constraint(equalTo: includeChromeBookmarksButton.bottomAnchor, constant: 24),
+
+            launchAtLoginButton.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            launchAtLoginButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
+            launchAtLoginButton.topAnchor.constraint(equalTo: startupLabel.bottomAnchor, constant: 14)
         ])
+    }
+
+    private func sectionLabel(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        return label
     }
 
     @objc private func toggleIncludeChromeBookmarks(_ sender: NSButton) {
         onIncludeChromeBookmarksChanged?(sender.state == .on)
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
+        onLaunchAtLoginChanged?(sender.state == .on)
     }
 }
 
@@ -3265,14 +3374,17 @@ final class PreferencesWindowController: NSWindowController {
 
     init(
         includeChromeBookmarks: Bool,
-        onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void
+        launchAtLogin: Bool,
+        onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void,
+        onLaunchAtLoginChanged: @escaping (Bool) -> Void
     ) {
         self.preferencesViewController = PreferencesViewController(
-            includeChromeBookmarks: includeChromeBookmarks
+            includeChromeBookmarks: includeChromeBookmarks,
+            launchAtLogin: launchAtLogin
         )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 174),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -3284,6 +3396,7 @@ final class PreferencesWindowController: NSWindowController {
 
         super.init(window: window)
         preferencesViewController.onIncludeChromeBookmarksChanged = onIncludeChromeBookmarksChanged
+        preferencesViewController.onLaunchAtLoginChanged = onLaunchAtLoginChanged
     }
 
     required init?(coder: NSCoder) {
@@ -3292,6 +3405,53 @@ final class PreferencesWindowController: NSWindowController {
 
     func syncFromPreferences() {
         preferencesViewController.setIncludeChromeBookmarks(AppPreferences.includeChromeBookmarks)
+        preferencesViewController.setLaunchAtLogin(LoginItemManager.isEnabled)
+    }
+}
+
+private enum LoginItemManager {
+    static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    static func enableByDefaultIfNeeded() {
+        guard
+            !AppPreferences.didApplyLaunchAtLoginDefault,
+            Bundle.main.bundleURL.pathExtension == "app"
+        else {
+            return
+        }
+
+        defer {
+            AppPreferences.didApplyLaunchAtLoginDefault = true
+        }
+
+        do {
+            try setEnabled(true)
+            AppLog.write("launch_at_login_default_applied", [
+                "launch_at_login": isEnabled
+            ])
+        } catch {
+            AppLog.write("launch_at_login_default_failed", [
+                "reason": error.localizedDescription
+            ])
+        }
+    }
+
+    static func setEnabled(_ enabled: Bool) throws {
+        if enabled {
+            guard !isEnabled else {
+                return
+            }
+
+            try SMAppService.mainApp.register()
+        } else {
+            guard isEnabled else {
+                return
+            }
+
+            try SMAppService.mainApp.unregister()
+        }
     }
 }
 
@@ -3563,6 +3723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow()
         setupStatusItem()
         registerHotKey()
+        LoginItemManager.enableByDefaultIfNeeded()
         refreshApplications(force: true)
         WindowPermissionManager.requestStartupPermissions()
         AppLog.write("application_did_finish_launching", [
@@ -3870,12 +4031,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if preferencesWindowController == nil {
             preferencesWindowController = PreferencesWindowController(
                 includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
+                launchAtLogin: LoginItemManager.isEnabled,
                 onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
                     AppPreferences.includeChromeBookmarks = includeChromeBookmarks
                     self?.refreshApplications(force: true)
                     AppLog.write("preferences_changed", [
                         "include_chrome_bookmarks": includeChromeBookmarks
                     ])
+                },
+                onLaunchAtLoginChanged: { [weak self] launchAtLogin in
+                    AppPreferences.didApplyLaunchAtLoginDefault = true
+
+                    do {
+                        try LoginItemManager.setEnabled(launchAtLogin)
+                        AppLog.write("preferences_changed", [
+                            "launch_at_login": LoginItemManager.isEnabled
+                        ])
+                    } catch {
+                        NSSound.beep()
+                        AppLog.write("preferences_change_failed", [
+                            "launch_at_login": launchAtLogin,
+                            "reason": error.localizedDescription
+                        ])
+                    }
+
+                    self?.preferencesWindowController?.syncFromPreferences()
                 }
             )
         }
@@ -3937,6 +4117,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let processIdentifier = frontmostApplication.processIdentifier
         previousFrontmostProcessIdentifier = processIdentifier
         previousFrontmostWindowTitle = WindowActivator.frontmostWindowTitle(for: processIdentifier)
+
+        if let previousFrontmostWindowTitle {
+            let appHistoryKey = historyKey(for: frontmostApplication)
+            let windowHistoryKey = WindowHistoryKey.make(
+                appHistoryKey: appHistoryKey,
+                title: previousFrontmostWindowTitle,
+                applicationName: frontmostApplication.localizedName
+            )
+            launchHistoryStore.recordUse(historyKey: windowHistoryKey)
+            AppLog.write("record_frontmost_window_use", [
+                "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
+                "localized_name": frontmostApplication.localizedName ?? "nil",
+                "pid": Int(processIdentifier),
+                "window_title": previousFrontmostWindowTitle,
+                "history_key": windowHistoryKey
+            ])
+        }
+
         AppLog.write("capture_previous_frontmost_window", [
             "pid": Int(processIdentifier),
             "localized_name": frontmostApplication.localizedName ?? "nil",
@@ -4060,6 +4258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "name": app.name,
             "application_name": (app.applicationName ?? "nil") as String,
             "bundle_id": (app.bundleIdentifier ?? "nil") as String,
+            "identity_key": app.identityKey,
+            "history_key": app.historyKey,
             "pid": logPID(app.processIdentifier),
             "is_running": app.isRunning,
             "target_kind": app.targetKind.logValue,
@@ -4288,6 +4488,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func logAudioDeviceIdentifier(_ audioDeviceIdentifier: AudioDeviceID?) -> Any {
         audioDeviceIdentifier.map { Int($0) } ?? NSNull()
+    }
+
+    private func historyKey(for runningApplication: NSRunningApplication) -> String {
+        if let bundleIdentifier = runningApplication.bundleIdentifier {
+            return "bundle:\(bundleIdentifier)"
+        }
+
+        if let bundleURL = runningApplication.bundleURL {
+            return "path:\(bundleURL.resolvingSymlinksInPath().path)"
+        }
+
+        return "pid:\(runningApplication.processIdentifier)"
     }
 
     private func trimmed(_ string: String?) -> String? {
