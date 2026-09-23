@@ -2,9 +2,18 @@ import CoreAudio
 import Darwin
 import Foundation
 
+struct HiddenCandidate: Codable, Hashable {
+    let key: String
+    let name: String
+    let subtitle: String
+    let kind: String
+}
+
 enum AppPreferences {
     private static let includeChromeBookmarksKey = "includeChromeBookmarks"
     private static let didApplyLaunchAtLoginDefaultKey = "didApplyLaunchAtLoginDefault"
+    private static let hiddenCandidateKeysKey = "hiddenCandidateKeys"
+    private static let hiddenCandidatesKey = "hiddenCandidates"
 
     static var includeChromeBookmarks: Bool {
         get {
@@ -26,6 +35,64 @@ enum AppPreferences {
         set {
             UserDefaults.standard.set(newValue, forKey: didApplyLaunchAtLoginDefaultKey)
         }
+    }
+
+    static var hiddenCandidates: [HiddenCandidate] {
+        get {
+            if
+                let data = UserDefaults.standard.data(forKey: hiddenCandidatesKey),
+                let candidates = try? JSONDecoder().decode([HiddenCandidate].self, from: data) {
+                return candidates
+            }
+
+            return (UserDefaults.standard.stringArray(forKey: hiddenCandidateKeysKey) ?? []).map {
+                HiddenCandidate(key: $0, name: $0, subtitle: "", kind: "")
+            }
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(data, forKey: hiddenCandidatesKey)
+            }
+            UserDefaults.standard.set(newValue.map(\.key).sorted(), forKey: hiddenCandidateKeysKey)
+        }
+    }
+
+    static var hiddenCandidateKeys: Set<String> {
+        Set(hiddenCandidates.map(\.key))
+    }
+
+    static var hiddenCandidateCount: Int {
+        hiddenCandidates.count
+    }
+
+    static func hideCandidate(_ app: LaunchableApp) {
+        var candidates = hiddenCandidates
+        let candidate = HiddenCandidate(
+            key: app.hiddenKey,
+            name: app.name,
+            subtitle: app.subtitle,
+            kind: app.targetKind.logValue
+        )
+
+        if let existingIndex = candidates.firstIndex(where: { $0.key == candidate.key }) {
+            candidates[existingIndex] = candidate
+        } else {
+            candidates.append(candidate)
+        }
+
+        hiddenCandidates = candidates
+    }
+
+    static func restoreHiddenCandidate(_ candidate: HiddenCandidate) {
+        hiddenCandidates = hiddenCandidates.filter { $0.key != candidate.key }
+    }
+
+    static func restoreHiddenCandidates() {
+        hiddenCandidates = []
+    }
+
+    static func isCandidateHidden(_ app: LaunchableApp) -> Bool {
+        hiddenCandidateKeys.contains(app.hiddenKey)
     }
 }
 
@@ -158,6 +225,10 @@ struct LaunchableApp: Hashable {
         }
 
         return url?.resolvingSymlinksInPath().path
+    }
+
+    var hiddenKey: String {
+        historyKey
     }
 
     func matches(_ query: String) -> Bool {

@@ -3191,6 +3191,9 @@ final class AppCellView: NSTableCellView {
     private let appIconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
+    private let hideButton = NSButton()
+    private var app: LaunchableApp?
+    private var onHide: ((LaunchableApp) -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -3202,7 +3205,11 @@ final class AppCellView: NSTableCellView {
         nil
     }
 
-    func configure(with app: LaunchableApp) {
+    func configure(with app: LaunchableApp, onHide: ((LaunchableApp) -> Void)?) {
+        self.app = app
+        self.onHide = onHide
+        hideButton.isHidden = onHide == nil
+
         if app.targetKind == .bluetoothConnect || app.targetKind == .bluetoothDisconnect {
             appIconView.image = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil)
         } else if app.targetKind == .webSearch {
@@ -3224,6 +3231,14 @@ final class AppCellView: NSTableCellView {
 
         titleLabel.stringValue = app.name
         detailLabel.stringValue = app.subtitle
+    }
+
+    @objc private func hideButtonClicked(_ sender: NSButton) {
+        guard let app else {
+            return
+        }
+
+        onHide?(app)
     }
 
     private func icon(forAudioTargetKind targetKind: LaunchTargetKind) -> NSImage? {
@@ -3251,12 +3266,23 @@ final class AppCellView: NSTableCellView {
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.lineBreakMode = .byTruncatingMiddle
 
+        hideButton.translatesAutoresizingMaskIntoConstraints = false
+        hideButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "Hide")
+        hideButton.imagePosition = .imageOnly
+        hideButton.isBordered = false
+        hideButton.focusRingType = .none
+        hideButton.contentTintColor = .secondaryLabelColor
+        hideButton.toolTip = "Hide"
+        hideButton.target = self
+        hideButton.action = #selector(hideButtonClicked(_:))
+
         imageView = appIconView
         textField = titleLabel
 
         addSubview(appIconView)
         addSubview(titleLabel)
         addSubview(detailLabel)
+        addSubview(hideButton)
 
         NSLayoutConstraint.activate([
             appIconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
@@ -3265,12 +3291,17 @@ final class AppCellView: NSTableCellView {
             appIconView.heightAnchor.constraint(equalToConstant: 32),
 
             titleLabel.leadingAnchor.constraint(equalTo: appIconView.trailingAnchor, constant: 12),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            titleLabel.trailingAnchor.constraint(equalTo: hideButton.leadingAnchor, constant: -10),
             titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
 
             detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2)
+            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+
+            hideButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            hideButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            hideButton.widthAnchor.constraint(equalToConstant: 28),
+            hideButton.heightAnchor.constraint(equalToConstant: 28)
         ])
     }
 }
@@ -3278,6 +3309,7 @@ final class AppCellView: NSTableCellView {
 final class PreferencesViewController: NSViewController {
     var onIncludeChromeBookmarksChanged: ((Bool) -> Void)?
     var onLaunchAtLoginChanged: ((Bool) -> Void)?
+    var onRestoreHiddenCandidate: ((HiddenCandidate) -> Void)?
 
     private let includeChromeBookmarksButton = NSButton(
         checkboxWithTitle: "Chrome bookmarks",
@@ -3289,11 +3321,20 @@ final class PreferencesViewController: NSViewController {
         target: nil,
         action: nil
     )
+    private let hiddenCandidatesLabel = NSTextField(labelWithString: "0 hidden")
+    private let hiddenCandidatesMenu = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let restoreHiddenCandidateButton = NSButton(
+        title: "Restore",
+        target: nil,
+        action: nil
+    )
+    private var hiddenCandidates: [HiddenCandidate] = []
 
-    init(includeChromeBookmarks: Bool, launchAtLogin: Bool) {
+    init(includeChromeBookmarks: Bool, launchAtLogin: Bool, hiddenCandidates: [HiddenCandidate]) {
         super.init(nibName: nil, bundle: nil)
         includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
         launchAtLoginButton.state = launchAtLogin ? .on : .off
+        setHiddenCandidates(hiddenCandidates)
     }
 
     required init?(coder: NSCoder) {
@@ -3301,7 +3342,7 @@ final class PreferencesViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 174))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 284))
     }
 
     override func viewDidLoad() {
@@ -3317,9 +3358,30 @@ final class PreferencesViewController: NSViewController {
         launchAtLoginButton.state = launchAtLogin ? .on : .off
     }
 
+    func setHiddenCandidates(_ hiddenCandidates: [HiddenCandidate]) {
+        self.hiddenCandidates = hiddenCandidates.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+        hiddenCandidatesLabel.stringValue = "\(hiddenCandidates.count) hidden"
+
+        hiddenCandidatesMenu.removeAllItems()
+        if self.hiddenCandidates.isEmpty {
+            hiddenCandidatesMenu.addItem(withTitle: "No hidden items")
+        } else {
+            for candidate in self.hiddenCandidates {
+                hiddenCandidatesMenu.addItem(withTitle: hiddenCandidateTitle(candidate))
+                hiddenCandidatesMenu.lastItem?.representedObject = candidate.key
+            }
+        }
+
+        hiddenCandidatesMenu.isEnabled = !self.hiddenCandidates.isEmpty
+        restoreHiddenCandidateButton.isEnabled = !self.hiddenCandidates.isEmpty
+    }
+
     private func setup() {
         let sourcesLabel = sectionLabel("Sources")
         let startupLabel = sectionLabel("Startup")
+        let hiddenItemsLabel = sectionLabel("Hidden Items")
 
         includeChromeBookmarksButton.translatesAutoresizingMaskIntoConstraints = false
         includeChromeBookmarksButton.target = self
@@ -3329,10 +3391,23 @@ final class PreferencesViewController: NSViewController {
         launchAtLoginButton.target = self
         launchAtLoginButton.action = #selector(toggleLaunchAtLogin(_:))
 
+        hiddenCandidatesLabel.translatesAutoresizingMaskIntoConstraints = false
+        hiddenCandidatesLabel.textColor = .secondaryLabelColor
+
+        hiddenCandidatesMenu.translatesAutoresizingMaskIntoConstraints = false
+
+        restoreHiddenCandidateButton.translatesAutoresizingMaskIntoConstraints = false
+        restoreHiddenCandidateButton.target = self
+        restoreHiddenCandidateButton.action = #selector(restoreHiddenCandidate(_:))
+
         view.addSubview(sourcesLabel)
         view.addSubview(includeChromeBookmarksButton)
         view.addSubview(startupLabel)
         view.addSubview(launchAtLoginButton)
+        view.addSubview(hiddenItemsLabel)
+        view.addSubview(hiddenCandidatesLabel)
+        view.addSubview(hiddenCandidatesMenu)
+        view.addSubview(restoreHiddenCandidateButton)
 
         NSLayoutConstraint.activate([
             sourcesLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 22),
@@ -3349,7 +3424,23 @@ final class PreferencesViewController: NSViewController {
 
             launchAtLoginButton.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
             launchAtLoginButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
-            launchAtLoginButton.topAnchor.constraint(equalTo: startupLabel.bottomAnchor, constant: 14)
+            launchAtLoginButton.topAnchor.constraint(equalTo: startupLabel.bottomAnchor, constant: 14),
+
+            hiddenItemsLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            hiddenItemsLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            hiddenItemsLabel.topAnchor.constraint(equalTo: launchAtLoginButton.bottomAnchor, constant: 24),
+
+            hiddenCandidatesLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            hiddenCandidatesLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            hiddenCandidatesLabel.topAnchor.constraint(equalTo: hiddenItemsLabel.bottomAnchor, constant: 8),
+
+            hiddenCandidatesMenu.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            hiddenCandidatesMenu.trailingAnchor.constraint(equalTo: restoreHiddenCandidateButton.leadingAnchor, constant: -10),
+            hiddenCandidatesMenu.topAnchor.constraint(equalTo: hiddenCandidatesLabel.bottomAnchor, constant: 10),
+
+            restoreHiddenCandidateButton.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            restoreHiddenCandidateButton.centerYAnchor.constraint(equalTo: hiddenCandidatesMenu.centerYAnchor),
+            restoreHiddenCandidateButton.widthAnchor.constraint(equalToConstant: 82)
         ])
     }
 
@@ -3367,6 +3458,26 @@ final class PreferencesViewController: NSViewController {
     @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
         onLaunchAtLoginChanged?(sender.state == .on)
     }
+
+    private func hiddenCandidateTitle(_ candidate: HiddenCandidate) -> String {
+        let name = candidate.name.isEmpty ? candidate.key : candidate.name
+        guard !candidate.kind.isEmpty else {
+            return name
+        }
+
+        return "\(name) (\(candidate.kind))"
+    }
+
+    @objc private func restoreHiddenCandidate(_ sender: NSButton) {
+        guard
+            let key = hiddenCandidatesMenu.selectedItem?.representedObject as? String,
+            let candidate = hiddenCandidates.first(where: { $0.key == key })
+        else {
+            return
+        }
+
+        onRestoreHiddenCandidate?(candidate)
+    }
 }
 
 final class PreferencesWindowController: NSWindowController {
@@ -3375,16 +3486,19 @@ final class PreferencesWindowController: NSWindowController {
     init(
         includeChromeBookmarks: Bool,
         launchAtLogin: Bool,
+        hiddenCandidates: [HiddenCandidate],
         onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void,
-        onLaunchAtLoginChanged: @escaping (Bool) -> Void
+        onLaunchAtLoginChanged: @escaping (Bool) -> Void,
+        onRestoreHiddenCandidate: @escaping (HiddenCandidate) -> Void
     ) {
         self.preferencesViewController = PreferencesViewController(
             includeChromeBookmarks: includeChromeBookmarks,
-            launchAtLogin: launchAtLogin
+            launchAtLogin: launchAtLogin,
+            hiddenCandidates: hiddenCandidates
         )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 174),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 284),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -3397,6 +3511,7 @@ final class PreferencesWindowController: NSWindowController {
         super.init(window: window)
         preferencesViewController.onIncludeChromeBookmarksChanged = onIncludeChromeBookmarksChanged
         preferencesViewController.onLaunchAtLoginChanged = onLaunchAtLoginChanged
+        preferencesViewController.onRestoreHiddenCandidate = onRestoreHiddenCandidate
     }
 
     required init?(coder: NSCoder) {
@@ -3406,6 +3521,7 @@ final class PreferencesWindowController: NSWindowController {
     func syncFromPreferences() {
         preferencesViewController.setIncludeChromeBookmarks(AppPreferences.includeChromeBookmarks)
         preferencesViewController.setLaunchAtLogin(LoginItemManager.isEnabled)
+        preferencesViewController.setHiddenCandidates(AppPreferences.hiddenCandidates)
     }
 }
 
@@ -3458,6 +3574,8 @@ private enum LoginItemManager {
 final class LauncherViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     var onLaunch: ((LaunchableApp) -> Void)?
     var onClose: (() -> Void)?
+    var onHide: ((LaunchableApp) -> Void)?
+    var isHidden: ((LaunchableApp) -> Bool)?
     var sortApps: (([LaunchableApp]) -> [LaunchableApp])?
 
     private let effectView = NSVisualEffectView()
@@ -3644,7 +3762,9 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
             owner: self
         ) as? AppCellView ?? AppCellView()
 
-        cell.configure(with: filteredApps[row])
+        cell.configure(with: filteredApps[row]) { [weak self] app in
+            self?.hide(app)
+        }
         return cell
     }
 
@@ -3659,10 +3779,14 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
 
     private func applyFilter() {
         let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let matchingApps = apps.filter { $0.matches(query) }
+        let matchingApps = apps.filter { app in
+            app.matches(query) && !(isHidden?(app) ?? false)
+        }
         filteredApps = sortApps?(matchingApps) ?? matchingApps
 
-        if let webSearchCandidate = WebSearchCandidateFactory.candidate(for: query) {
+        if
+            let webSearchCandidate = WebSearchCandidateFactory.candidate(for: query),
+            !(isHidden?(webSearchCandidate) ?? false) {
             filteredApps.append(webSearchCandidate)
         }
 
@@ -3695,6 +3819,11 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         }
 
         onLaunch?(filteredApps[selectedRow])
+    }
+
+    private func hide(_ app: LaunchableApp) {
+        onHide?(app)
+        applyFilter()
     }
 }
 
@@ -3895,6 +4024,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launcherViewController.onClose = { [weak self] in
             self?.hideLauncher()
         }
+        launcherViewController.onHide = { [weak self] app in
+            self?.hideCandidate(app)
+        }
+        launcherViewController.isHidden = { app in
+            AppPreferences.isCandidateHidden(app)
+        }
         launcherViewController.sortApps = { [weak self] apps in
             self?.launchHistoryStore.sort(apps) ?? apps
         }
@@ -4032,6 +4167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             preferencesWindowController = PreferencesWindowController(
                 includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
                 launchAtLogin: LoginItemManager.isEnabled,
+                hiddenCandidates: AppPreferences.hiddenCandidates,
                 onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
                     AppPreferences.includeChromeBookmarks = includeChromeBookmarks
                     self?.refreshApplications(force: true)
@@ -4056,6 +4192,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self?.preferencesWindowController?.syncFromPreferences()
+                },
+                onRestoreHiddenCandidate: { [weak self] candidate in
+                    AppPreferences.restoreHiddenCandidate(candidate)
+                    self?.refreshApplications(force: true)
+                    self?.preferencesWindowController?.syncFromPreferences()
+                    AppLog.write("hidden_candidate_restored", [
+                        "name": candidate.name,
+                        "kind": candidate.kind,
+                        "hidden_key": candidate.key,
+                        "hidden_candidate_count": AppPreferences.hiddenCandidateCount
+                    ])
                 }
             )
         }
@@ -4213,6 +4360,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func noopCandidateReason(for app: LaunchableApp) -> String? {
+        if AppPreferences.isCandidateHidden(app) {
+            return "hidden_by_user"
+        }
+
         if isCurrentRunningApplication(app) {
             return "frontmost_running_application"
         }
@@ -4226,6 +4377,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return nil
+    }
+
+    private func hideCandidate(_ app: LaunchableApp) {
+        AppPreferences.hideCandidate(app)
+        preferencesWindowController?.syncFromPreferences()
+        AppLog.write("candidate_hidden", [
+            "name": app.name,
+            "application_name": app.applicationName ?? "nil",
+            "bundle_id": app.bundleIdentifier ?? "nil",
+            "target_kind": app.targetKind.logValue,
+            "hidden_key": app.hiddenKey,
+            "hidden_candidate_count": AppPreferences.hiddenCandidateCount
+        ])
     }
 
     private func isCurrentRunningApplication(_ app: LaunchableApp) -> Bool {
