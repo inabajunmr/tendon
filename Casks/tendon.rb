@@ -1,6 +1,6 @@
 cask "tendon" do
-  version "0.0.1"
-  sha256 "968406c1b2543b35abff6f8fe178ebf220278540be55250dcae132891c60392f"
+  version "0.0.2"
+  sha256 "10f5f134c3342a45d0bbea6b5d842bbb74bb621478610a21402106655ed733e6"
 
   url "https://github.com/inabajunmr/tako/releases/download/v#{version}/Tendon-#{version}-macos-arm64.zip"
   name "Tendon"

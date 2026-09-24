@@ -3836,6 +3836,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
+    private var hotKeyEventTap: CFMachPort?
+    private var hotKeyEventTapRunLoopSource: CFRunLoopSource?
+    private var hotKeyFallbackMonitor: Any?
+    private var lastHotKeyTriggerDate = Date.distantPast
     private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedBookmarks: [LaunchableApp] = []
     private var cachedAudioDevices: [LaunchableApp] = []
@@ -3993,6 +3997,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let eventHandlerRef {
             RemoveEventHandler(eventHandlerRef)
         }
+
+        if let hotKeyEventTapRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), hotKeyEventTapRunLoopSource, .commonModes)
+        }
+
+        if let hotKeyEventTap {
+            CFMachPortInvalidate(hotKeyEventTap)
+        }
+
+        if let hotKeyFallbackMonitor {
+            NSEvent.removeMonitor(hotKeyFallbackMonitor)
+        }
     }
 
     private func setupWindow() {
@@ -4101,7 +4117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 var hotKeyID = EventHotKeyID()
-                GetEventParameter(
+                let parameterStatus = GetEventParameter(
                     event,
                     EventParamName(kEventParamDirectObject),
                     EventParamType(typeEventHotKeyID),
@@ -4111,16 +4127,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     &hotKeyID
                 )
 
-                guard hotKeyID.id == 1 else {
-                    return noErr
-                }
-
                 let delegate = Unmanaged<AppDelegate>
                     .fromOpaque(userData)
                     .takeUnretainedValue()
 
                 DispatchQueue.main.async {
-                    delegate.toggleLauncher()
+                    guard hotKeyID.id == 1 else {
+                        delegate.logIgnoredHotKey(
+                            source: "carbon",
+                            parameterStatus: parameterStatus,
+                            hotKeyID: hotKeyID
+                        )
+                        return
+                    }
+
+                    delegate.triggerLauncherFromHotKey(
+                        source: "carbon",
+                        fields: [
+                            "parameter_status": Int(parameterStatus),
+                            "hotkey_id": Int(hotKeyID.id),
+                            "hotkey_signature": Int(hotKeyID.signature)
+                        ]
+                    )
                 }
 
                 return noErr
@@ -4130,6 +4158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Unmanaged.passUnretained(self).toOpaque(),
             &eventHandlerRef
         )
+
+        AppLog.write("hotkey_handler_install", [
+            "status": Int(installStatus)
+        ])
 
         guard installStatus == noErr else {
             reportHotKeyFailure(status: installStatus)
@@ -4146,13 +4178,199 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             &hotKeyRef
         )
 
+        AppLog.write("hotkey_register", [
+            "status": Int(registerStatus),
+            "key_code": Int(kVK_ANSI_N),
+            "modifiers": Int(optionKey),
+            "target": "application"
+        ])
+
         if registerStatus != noErr {
             reportHotKeyFailure(status: registerStatus)
         }
+
+        installHotKeyEventTap()
+        installHotKeyFallbackMonitor()
+    }
+
+    private func installHotKeyEventTap() {
+        let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let delegate = Unmanaged<AppDelegate>
+                .fromOpaque(userInfo)
+                .takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                DispatchQueue.main.async {
+                    delegate.handleHotKeyEventTapDisabled(type)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            guard type == .keyDown, delegate.isLauncherHotKey(event) else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let flags = event.flags
+            DispatchQueue.main.async {
+                delegate.triggerLauncherFromHotKey(
+                    source: "event_tap",
+                    fields: [
+                        "key_code": Int(keyCode),
+                        "modifier_flags": Int(flags.rawValue)
+                    ]
+                )
+            }
+
+            return nil
+        }
+
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            AppLog.write("hotkey_event_tap_install", [
+                "installed": false,
+                "tap": "cgSessionEventTap",
+                "options": "defaultTap"
+            ])
+            return
+        }
+
+        guard let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0) else {
+            CFMachPortInvalidate(eventTap)
+            AppLog.write("hotkey_event_tap_install", [
+                "installed": false,
+                "reason": "failed_to_create_run_loop_source"
+            ])
+            return
+        }
+
+        hotKeyEventTap = eventTap
+        hotKeyEventTapRunLoopSource = runLoopSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+
+        AppLog.write("hotkey_event_tap_install", [
+            "installed": true,
+            "tap": "cgSessionEventTap",
+            "options": "defaultTap"
+        ])
+    }
+
+    private func installHotKeyFallbackMonitor() {
+        hotKeyFallbackMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard self?.isLauncherHotKey(event) == true else {
+                return
+            }
+
+            DispatchQueue.main.async {
+                self?.triggerLauncherFromHotKey(
+                    source: "global_monitor",
+                    fields: [
+                        "key_code": Int(event.keyCode),
+                        "modifier_flags": UInt(event.modifierFlags.rawValue)
+                    ]
+                )
+            }
+        }
+
+        AppLog.write("hotkey_fallback_monitor_install", [
+            "installed": hotKeyFallbackMonitor != nil
+        ])
+    }
+
+    private func isLauncherHotKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return isLauncherHotKey(
+            keyCode: event.keyCode,
+            hasOption: flags.contains(.option),
+            hasCommand: flags.contains(.command),
+            hasControl: flags.contains(.control)
+        )
+    }
+
+    private func isLauncherHotKey(_ event: CGEvent) -> Bool {
+        let flags = event.flags
+        return isLauncherHotKey(
+            keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)),
+            hasOption: flags.contains(.maskAlternate),
+            hasCommand: flags.contains(.maskCommand),
+            hasControl: flags.contains(.maskControl)
+        )
+    }
+
+    private func isLauncherHotKey(
+        keyCode: UInt16,
+        hasOption: Bool,
+        hasCommand: Bool,
+        hasControl: Bool
+    ) -> Bool {
+        keyCode == UInt16(kVK_ANSI_N) &&
+            hasOption &&
+            !hasCommand &&
+            !hasControl
+    }
+
+    private func handleHotKeyEventTapDisabled(_ type: CGEventType) {
+        if let hotKeyEventTap {
+            CGEvent.tapEnable(tap: hotKeyEventTap, enable: true)
+        }
+
+        AppLog.write("hotkey_event_tap_disabled", [
+            "type": Int(type.rawValue),
+            "reenabled": hotKeyEventTap != nil
+        ])
+    }
+
+    private func triggerLauncherFromHotKey(source: String, fields: [String: Any]) {
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        let now = Date()
+        var payload = fields
+        payload["source"] = source
+        payload["frontmost_pid"] = frontmostApplication.map { Int($0.processIdentifier) } ?? NSNull()
+        payload["frontmost_bundle_id"] = frontmostApplication?.bundleIdentifier ?? "nil"
+        payload["frontmost_name"] = frontmostApplication?.localizedName ?? "nil"
+
+        if now.timeIntervalSince(lastHotKeyTriggerDate) < 0.25 {
+            payload["result"] = "debounced"
+            AppLog.write("hotkey_trigger", payload)
+            return
+        }
+
+        lastHotKeyTriggerDate = now
+        payload["result"] = "toggle_launcher"
+        AppLog.write("hotkey_trigger", payload)
+        toggleLauncher()
+    }
+
+    private func logIgnoredHotKey(source: String, parameterStatus: OSStatus, hotKeyID: EventHotKeyID) {
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        AppLog.write("hotkey_ignored", [
+            "source": source,
+            "parameter_status": Int(parameterStatus),
+            "hotkey_id": Int(hotKeyID.id),
+            "hotkey_signature": Int(hotKeyID.signature),
+            "frontmost_pid": frontmostApplication.map { Int($0.processIdentifier) } ?? NSNull(),
+            "frontmost_bundle_id": frontmostApplication?.bundleIdentifier ?? "nil",
+            "frontmost_name": frontmostApplication?.localizedName ?? "nil"
+        ])
     }
 
     private func reportHotKeyFailure(status: OSStatus) {
         fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
+        AppLog.write("hotkey_register_failed", [
+            "status": Int(status)
+        ])
         statusItem?.button?.title = "Tendon!"
         statusItem?.button?.toolTip = "Option+N could not be registered"
     }
