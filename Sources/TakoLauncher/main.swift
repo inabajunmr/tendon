@@ -1044,9 +1044,10 @@ private enum AudioDeviceDiscovery {
         let searchText = searchTextParts
             .compactMap { $0 }
             .joined(separator: " ")
+        let displayName = isCurrent ? "\(device.name) (Current)" : device.name
 
         return LaunchableApp(
-            name: device.name,
+            name: displayName,
             applicationName: isCurrent ? "Current" : nil,
             url: nil,
             bundleIdentifier: nil,
@@ -4372,10 +4373,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return "frontmost_window"
         }
 
-        if isCurrentAudioDevice(app) {
-            return "current_audio_device"
-        }
-
         return nil
     }
 
@@ -4409,11 +4406,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return normalized(windowTitle) == normalized(previousTitle)
-    }
-
-    private func isCurrentAudioDevice(_ app: LaunchableApp) -> Bool {
-        (app.targetKind == .audioInput || app.targetKind == .audioOutput) &&
-            app.applicationName == "Current"
     }
 
     private func launch(_ app: LaunchableApp) {
