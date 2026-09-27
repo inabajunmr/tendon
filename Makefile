@@ -1,17 +1,18 @@
 -include local.env
 
 APP_NAME := Tendon
-BUILD_DIR := .build/release
+CONFIGURATION ?= release
+BUILD_DIR := .build/$(CONFIGURATION)
 APP_DIR := dist/$(APP_NAME).app
 CONTENTS_DIR := $(APP_DIR)/Contents
 MACOS_DIR := $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR := $(CONTENTS_DIR)/Resources
 CODESIGN_IDENTITY ?= -
 
-.PHONY: build run package open cask release release-github
+.PHONY: build run package package-debug open cask release release-github
 
 build:
-	swift build -c release
+	swift build -c $(CONFIGURATION)
 
 run:
 	swift run Tendon
@@ -26,6 +27,9 @@ package: build
 	chmod +x "$(MACOS_DIR)/$(APP_NAME)"
 	codesign --force --deep --sign "$(CODESIGN_IDENTITY)" "$(APP_DIR)"
 	touch "$(APP_DIR)"
+
+package-debug:
+	$(MAKE) package CONFIGURATION=debug
 
 open: package
 	open -n "$(APP_DIR)"

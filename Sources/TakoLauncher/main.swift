@@ -407,7 +407,8 @@ enum AppDiscovery {
             targetKind: .application,
             windowTitle: nil,
             windowFrame: nil,
-            windowIdentifier: nil
+            windowIdentifier: nil,
+            windowSortIndex: nil
         )
     }
 
@@ -578,8 +579,8 @@ enum AppDiscovery {
             candidates.append(candidate)
         }
 
-        accessibilityWindowCandidates(for: apps).forEach(append)
         coreGraphicsWindowCandidates(for: apps).forEach(append)
+        accessibilityWindowCandidates(for: apps).forEach(append)
 
         return candidates
     }
@@ -612,7 +613,8 @@ enum AppDiscovery {
                     title: title,
                     identityKey: identityKey,
                     frame: AccessibilityWindowGeometry.frame(of: window),
-                    windowIdentifier: windowIdentifier
+                    windowIdentifier: windowIdentifier,
+                    windowSortIndex: nil
                 )
             }
         }
@@ -629,7 +631,7 @@ enum AppDiscovery {
             }
         )
 
-        return CoreGraphicsWindowReader.candidateWindows().compactMap { windowInfo in
+        return CoreGraphicsWindowReader.candidateWindows().enumerated().compactMap { index, windowInfo in
             guard
                 let baseApp = appsByPID[windowInfo.ownerProcessIdentifier],
                 let title = windowInfo.title,
@@ -644,7 +646,8 @@ enum AppDiscovery {
                 title: title,
                 identityKey: identityKey,
                 frame: windowInfo.frame,
-                windowIdentifier: identifier
+                windowIdentifier: identifier,
+                windowSortIndex: index
             )
         }
     }
@@ -654,7 +657,8 @@ enum AppDiscovery {
         title: String,
         identityKey: String,
         frame: WindowFrame?,
-        windowIdentifier: UInt32?
+        windowIdentifier: UInt32?,
+        windowSortIndex: Int?
     ) -> LaunchableApp {
         let applicationName = baseApp.applicationName ?? baseApp.name
         let historyKey = WindowHistoryKey.make(
@@ -688,7 +692,8 @@ enum AppDiscovery {
             targetKind: .window,
             windowTitle: title,
             windowFrame: frame,
-            windowIdentifier: windowIdentifier
+            windowIdentifier: windowIdentifier,
+            windowSortIndex: windowSortIndex
         )
     }
 
@@ -3839,6 +3844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyEventTap: CFMachPort?
     private var hotKeyEventTapRunLoopSource: CFRunLoopSource?
     private var hotKeyFallbackMonitor: Any?
+    private var hotKeyRetryScheduled = false
     private var lastHotKeyTriggerDate = Date.distantPast
     private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedBookmarks: [LaunchableApp] = []
@@ -3857,6 +3863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow()
         setupStatusItem()
         registerHotKey()
+        scheduleHotKeyInfrastructureRetries()
         LoginItemManager.enableByDefaultIfNeeded()
         refreshApplications(force: true)
         WindowPermissionManager.requestStartupPermissions()
@@ -3886,15 +3893,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let bundleURL = Bundle.main.bundleURL
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-n", bundleURL.path]
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "sleep 0.5; /usr/bin/open -n \"$TENDON_BUNDLE_PATH\""
+        ]
+        process.environment = [
+            "TENDON_BUNDLE_PATH": bundleURL.path
+        ]
 
         do {
             try process.run()
             AppLog.write("relaunch_current_bundle", [
                 "reason": reason,
                 "bundle_path": bundleURL.path,
-                "result": "started"
+                "result": "scheduled_after_termination"
             ])
             NSApp.terminate(nil)
         } catch {
@@ -4024,6 +4037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isFloatingPanel = true
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.hidesOnDeactivate = false
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
@@ -4057,17 +4071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.toolTip = "Tendon"
-
-            if let icon = statusItemIcon() {
-                icon.size = NSSize(width: 18, height: 18)
-                icon.isTemplate = false
-                button.image = icon
-                button.imagePosition = .imageOnly
-                button.title = ""
-            } else {
-                button.title = "Tendon"
-            }
+            configureStatusItemButton(button)
         }
 
         let menu = NSMenu()
@@ -4103,12 +4107,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSImage(contentsOf: developmentIconURL)
     }
 
+    private func configureStatusItemButton(_ button: NSStatusBarButton) {
+        button.toolTip = "Tendon"
+
+        if let icon = statusItemIcon() {
+            icon.size = NSSize(width: 18, height: 18)
+            icon.isTemplate = false
+            button.image = icon
+            button.imagePosition = .imageOnly
+            button.title = ""
+        } else {
+            button.image = nil
+            button.title = "Tendon"
+        }
+    }
+
     private func registerHotKey() {
+        ensureHotKeyInfrastructure(reason: "startup")
+    }
+
+    private func scheduleHotKeyInfrastructureRetries() {
+        guard !hotKeyRetryScheduled else {
+            return
+        }
+
+        hotKeyRetryScheduled = true
+
+        for delay in [0.5, 1.5, 3.0, 8.0, 20.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.ensureHotKeyInfrastructure(reason: "delayed_retry_\(delay)s")
+            }
+        }
+    }
+
+    private func ensureHotKeyInfrastructure(reason: String) {
+        AppLog.write("hotkey_infrastructure_ensure", [
+            "reason": reason,
+            "has_carbon_handler": eventHandlerRef != nil,
+            "has_carbon_hotkey": hotKeyRef != nil,
+            "has_event_tap": hotKeyEventTap != nil,
+            "has_fallback_monitor": hotKeyFallbackMonitor != nil
+        ])
+
+        installCarbonHotKeyHandler(reason: reason)
+        registerCarbonHotKey(reason: reason)
+        installHotKeyEventTap(reason: reason)
+        installHotKeyFallbackMonitor(reason: reason)
+    }
+
+    private func installCarbonHotKeyHandler(reason: String) {
+        guard eventHandlerRef == nil else {
+            return
+        }
+
         var eventSpec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
 
+        var installedHandlerRef: EventHandlerRef?
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             { _, event, userData in
@@ -4156,29 +4213,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             1,
             &eventSpec,
             Unmanaged.passUnretained(self).toOpaque(),
-            &eventHandlerRef
+            &installedHandlerRef
         )
 
         AppLog.write("hotkey_handler_install", [
+            "reason": reason,
             "status": Int(installStatus)
         ])
 
         guard installStatus == noErr else {
+            eventHandlerRef = nil
             reportHotKeyFailure(status: installStatus)
             return
         }
 
+        guard let installedHandlerRef else {
+            eventHandlerRef = nil
+            AppLog.write("hotkey_handler_install", [
+                "reason": reason,
+                "status": Int(installStatus),
+                "failure_reason": "missing_handler_ref"
+            ])
+            return
+        }
+
+        eventHandlerRef = installedHandlerRef
+    }
+
+    private func registerCarbonHotKey(reason: String) {
+        guard eventHandlerRef != nil else {
+            AppLog.write("hotkey_register", [
+                "reason": reason,
+                "result": "skipped_no_handler"
+            ])
+            return
+        }
+
+        guard hotKeyRef == nil else {
+            return
+        }
+
         let hotKeyID = EventHotKeyID(signature: fourCharacterCode("TNDN"), id: 1)
+        var registeredHotKeyRef: EventHotKeyRef?
         let registerStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_N),
             UInt32(optionKey),
             hotKeyID,
             GetApplicationEventTarget(),
             0,
-            &hotKeyRef
+            &registeredHotKeyRef
         )
 
         AppLog.write("hotkey_register", [
+            "reason": reason,
             "status": Int(registerStatus),
             "key_code": Int(kVK_ANSI_N),
             "modifiers": Int(optionKey),
@@ -4186,14 +4273,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         if registerStatus != noErr {
+            hotKeyRef = nil
             reportHotKeyFailure(status: registerStatus)
+            return
         }
 
-        installHotKeyEventTap()
-        installHotKeyFallbackMonitor()
+        guard let registeredHotKeyRef else {
+            hotKeyRef = nil
+            AppLog.write("hotkey_register", [
+                "reason": reason,
+                "status": Int(registerStatus),
+                "failure_reason": "missing_hotkey_ref"
+            ])
+            return
+        }
+
+        hotKeyRef = registeredHotKeyRef
+        updateStatusItemForHotKeyAvailable()
     }
 
-    private func installHotKeyEventTap() {
+    private func installHotKeyEventTap(reason: String) {
+        if let hotKeyEventTap {
+            CGEvent.tapEnable(tap: hotKeyEventTap, enable: true)
+            AppLog.write("hotkey_event_tap_install", [
+                "reason": reason,
+                "installed": true,
+                "result": "already_installed_reenabled"
+            ])
+            return
+        }
+
         let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
             guard let userInfo else {
@@ -4239,6 +4348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             AppLog.write("hotkey_event_tap_install", [
+                "reason": reason,
                 "installed": false,
                 "tap": "cgSessionEventTap",
                 "options": "defaultTap"
@@ -4249,8 +4359,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0) else {
             CFMachPortInvalidate(eventTap)
             AppLog.write("hotkey_event_tap_install", [
+                "reason": reason,
                 "installed": false,
-                "reason": "failed_to_create_run_loop_source"
+                "failure_reason": "failed_to_create_run_loop_source"
             ])
             return
         }
@@ -4261,13 +4372,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CGEvent.tapEnable(tap: eventTap, enable: true)
 
         AppLog.write("hotkey_event_tap_install", [
+            "reason": reason,
             "installed": true,
             "tap": "cgSessionEventTap",
             "options": "defaultTap"
         ])
+
+        updateStatusItemForHotKeyAvailable()
     }
 
-    private func installHotKeyFallbackMonitor() {
+    private func installHotKeyFallbackMonitor(reason: String) {
+        guard hotKeyFallbackMonitor == nil else {
+            return
+        }
+
         hotKeyFallbackMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard self?.isLauncherHotKey(event) == true else {
                 return
@@ -4285,8 +4403,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         AppLog.write("hotkey_fallback_monitor_install", [
+            "reason": reason,
             "installed": hotKeyFallbackMonitor != nil
         ])
+
+        if hotKeyFallbackMonitor != nil {
+            updateStatusItemForHotKeyAvailable()
+        }
     }
 
     private func isLauncherHotKey(_ event: NSEvent) -> Bool {
@@ -4366,6 +4489,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
     }
 
+    private func updateStatusItemForHotKeyAvailable() {
+        guard let button = statusItem?.button else {
+            return
+        }
+
+        configureStatusItemButton(button)
+    }
+
     private func reportHotKeyFailure(status: OSStatus) {
         fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
         AppLog.write("hotkey_register_failed", [
@@ -4381,6 +4512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showPreferencesFromMenu() {
         hideLauncher()
+        ensureHotKeyInfrastructure(reason: "show_preferences")
 
         if preferencesWindowController == nil {
             preferencesWindowController = PreferencesWindowController(
@@ -4437,7 +4569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if window.isVisible {
+        if window.isVisible && NSApp.isActive && window.isKeyWindow {
             hideLauncher()
         } else {
             showLauncher()
@@ -4458,16 +4590,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "previous_title": previousFrontmostWindowTitle ?? "nil"
         ])
 
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        presentLauncherWindow()
 
+        // The first presentation after launch can become visible without becoming key.
+        // Re-present on the next pass after AppKit processes activation.
         DispatchQueue.main.async { [weak self] in
+            self?.presentLauncherWindow()
             self?.launcherViewController.focusSearchField()
         }
     }
 
     private func hideLauncher() {
         window?.orderOut(nil)
+    }
+
+    private func presentLauncherWindow() {
+        guard let window else {
+            return
+        }
+
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     private func capturePreviousFrontmostWindow() {
@@ -4639,6 +4784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "target_kind": app.targetKind.logValue,
             "window_title": (app.windowTitle ?? "nil") as String,
             "window_identifier": logWindowIdentifier(app.windowIdentifier),
+            "window_sort_index": app.windowSortIndex.map { Int($0) } ?? NSNull(),
             "window_frame": logFrame(app.windowFrame),
             "audio_device_id": logAudioDeviceIdentifier(app.audioDeviceIdentifier),
             "audio_device_uid": app.audioDeviceUID ?? "nil",

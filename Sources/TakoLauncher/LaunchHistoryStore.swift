@@ -72,6 +72,22 @@ final class LaunchHistoryStore {
                 return lhsCount > rhsCount
             }
 
+            if
+                lhs.targetKind == .window,
+                rhs.targetKind == .window,
+                lhs.windowSortIndex != rhs.windowSortIndex {
+                switch (lhs.windowSortIndex, rhs.windowSortIndex) {
+                case let (lhsIndex?, rhsIndex?):
+                    return lhsIndex < rhsIndex
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    break
+                }
+            }
+
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
     }

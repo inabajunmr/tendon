@@ -149,6 +149,7 @@ struct LaunchableApp: Hashable {
     let windowTitle: String?
     let windowFrame: WindowFrame?
     let windowIdentifier: UInt32?
+    let windowSortIndex: Int?
     let audioDeviceIdentifier: AudioDeviceID?
     let audioDeviceUID: String?
     let bluetoothDeviceAddress: String?
@@ -167,6 +168,7 @@ struct LaunchableApp: Hashable {
         windowTitle: String?,
         windowFrame: WindowFrame?,
         windowIdentifier: UInt32?,
+        windowSortIndex: Int? = nil,
         audioDeviceIdentifier: AudioDeviceID? = nil,
         audioDeviceUID: String? = nil,
         bluetoothDeviceAddress: String? = nil
@@ -184,6 +186,7 @@ struct LaunchableApp: Hashable {
         self.windowTitle = windowTitle
         self.windowFrame = windowFrame
         self.windowIdentifier = windowIdentifier
+        self.windowSortIndex = windowSortIndex
         self.audioDeviceIdentifier = audioDeviceIdentifier
         self.audioDeviceUID = audioDeviceUID
         self.bluetoothDeviceAddress = bluetoothDeviceAddress
@@ -271,6 +274,7 @@ struct LaunchableApp: Hashable {
             windowTitle: windowTitle,
             windowFrame: windowFrame,
             windowIdentifier: windowIdentifier,
+            windowSortIndex: windowSortIndex,
             audioDeviceIdentifier: audioDeviceIdentifier,
             audioDeviceUID: audioDeviceUID,
             bluetoothDeviceAddress: bluetoothDeviceAddress
