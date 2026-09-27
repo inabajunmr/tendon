@@ -4126,6 +4126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ensureHotKeyInfrastructure(reason: "startup")
     }
 
+    private func carbonHotKeyTarget() -> EventTargetRef {
+        GetEventDispatcherTarget()
+    }
+
     private func scheduleHotKeyInfrastructureRetries() {
         guard !hotKeyRetryScheduled else {
             return
@@ -4167,7 +4171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         var installedHandlerRef: EventHandlerRef?
         let installStatus = InstallEventHandler(
-            GetApplicationEventTarget(),
+            carbonHotKeyTarget(),
             { _, event, userData in
                 guard let event, let userData else {
                     return noErr
@@ -4259,7 +4263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UInt32(kVK_ANSI_N),
             UInt32(optionKey),
             hotKeyID,
-            GetApplicationEventTarget(),
+            carbonHotKeyTarget(),
             0,
             &registeredHotKeyRef
         )
@@ -4269,7 +4273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "status": Int(registerStatus),
             "key_code": Int(kVK_ANSI_N),
             "modifiers": Int(optionKey),
-            "target": "application"
+            "target": "event_dispatcher"
         ])
 
         if registerStatus != noErr {

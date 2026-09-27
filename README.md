@@ -20,6 +20,25 @@ make package
 open -n dist/Tendon.app
 ```
 
+`make package` builds a release app bundle. Debug logging is disabled in release builds.
+
+## Package a debug app bundle
+
+Use a debug bundle when investigating launcher behavior, hotkey handling, or window activation:
+
+```sh
+make package-debug
+open -n dist/Tendon.app
+```
+
+Debug builds write JSONL logs to:
+
+```text
+logs/YYYYMMDD-HHMMSS.jsonl
+```
+
+Run `make package` again when you want to replace `dist/Tendon.app` with the normal release build.
+
 ## Build a GitHub release zip
 
 Tendon is currently distributed as an unsigned/not-notarized Apple Silicon build.
