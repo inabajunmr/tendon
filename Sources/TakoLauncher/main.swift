@@ -3843,7 +3843,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyEventTap: CFMachPort?
     private var hotKeyEventTapRunLoopSource: CFRunLoopSource?
+    private var hotKeyEventTapName: String?
     private var hotKeyFallbackMonitor: Any?
+    private var launcherLocalMouseMonitor: Any?
+    private var launcherGlobalMouseMonitor: Any?
     private var hotKeyRetryScheduled = false
     private var lastHotKeyTriggerDate = Date.distantPast
     private var cachedInstalledApps: [LaunchableApp] = []
@@ -4018,10 +4021,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let hotKeyEventTap {
             CFMachPortInvalidate(hotKeyEventTap)
         }
+        hotKeyEventTapName = nil
 
         if let hotKeyFallbackMonitor {
             NSEvent.removeMonitor(hotKeyFallbackMonitor)
         }
+
+        removeLauncherDismissMonitors()
     }
 
     private func setupWindow() {
@@ -4302,6 +4308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLog.write("hotkey_event_tap_install", [
                 "reason": reason,
                 "installed": true,
+                "tap": hotKeyEventTapName ?? "unknown",
                 "result": "already_installed_reenabled"
             ])
             return
@@ -4343,18 +4350,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        guard let eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: eventMask,
-            callback: callback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
+        let tapConfigurations: [(location: CGEventTapLocation, name: String)] = [
+            (.cghidEventTap, "cghidEventTap"),
+            (.cgSessionEventTap, "cgSessionEventTap")
+        ]
+
+        var createdEventTap: CFMachPort?
+        var createdTapName: String?
+
+        for tapConfiguration in tapConfigurations {
+            guard createdEventTap == nil else {
+                break
+            }
+
+            if let eventTap = CGEvent.tapCreate(
+                tap: tapConfiguration.location,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: eventMask,
+                callback: callback,
+                userInfo: Unmanaged.passUnretained(self).toOpaque()
+            ) {
+                createdEventTap = eventTap
+                createdTapName = tapConfiguration.name
+            } else {
+                AppLog.write("hotkey_event_tap_install_attempt", [
+                    "reason": reason,
+                    "installed": false,
+                    "tap": tapConfiguration.name,
+                    "options": "defaultTap"
+                ])
+            }
+        }
+
+        guard let eventTap = createdEventTap, let tapName = createdTapName else {
             AppLog.write("hotkey_event_tap_install", [
                 "reason": reason,
                 "installed": false,
-                "tap": "cgSessionEventTap",
+                "tap": "none",
                 "options": "defaultTap"
             ])
             return
@@ -4371,6 +4404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         hotKeyEventTap = eventTap
+        hotKeyEventTapName = tapName
         hotKeyEventTapRunLoopSource = runLoopSource
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
@@ -4378,7 +4412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLog.write("hotkey_event_tap_install", [
             "reason": reason,
             "installed": true,
-            "tap": "cgSessionEventTap",
+            "tap": tapName,
             "options": "defaultTap"
         ])
 
@@ -4595,6 +4629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         presentLauncherWindow()
+        installLauncherDismissMonitors()
 
         // The first presentation after launch can become visible without becoming key.
         // Re-present on the next pass after AppKit processes activation.
@@ -4606,6 +4641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideLauncher() {
         window?.orderOut(nil)
+        removeLauncherDismissMonitors()
     }
 
     private func presentLauncherWindow() {
@@ -4617,6 +4653,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+    }
+
+    private func installLauncherDismissMonitors() {
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        if launcherLocalMouseMonitor == nil {
+            launcherLocalMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+                self?.hideLauncherIfClickIsOutside(event)
+                return event
+            }
+        }
+
+        if launcherGlobalMouseMonitor == nil {
+            launcherGlobalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+                self?.hideLauncherIfClickIsOutside(event)
+            }
+        }
+    }
+
+    private func removeLauncherDismissMonitors() {
+        if let launcherLocalMouseMonitor {
+            NSEvent.removeMonitor(launcherLocalMouseMonitor)
+            self.launcherLocalMouseMonitor = nil
+        }
+
+        if let launcherGlobalMouseMonitor {
+            NSEvent.removeMonitor(launcherGlobalMouseMonitor)
+            self.launcherGlobalMouseMonitor = nil
+        }
+    }
+
+    private func hideLauncherIfClickIsOutside(_ event: NSEvent) {
+        guard let window, window.isVisible else {
+            return
+        }
+
+        if !window.frame.contains(screenPoint(for: event)) {
+            hideLauncher()
+        }
+    }
+
+    private func screenPoint(for event: NSEvent) -> NSPoint {
+        guard let eventWindow = event.window else {
+            return NSEvent.mouseLocation
+        }
+
+        return eventWindow
+            .convertToScreen(NSRect(origin: event.locationInWindow, size: .zero))
+            .origin
     }
 
     private func capturePreviousFrontmostWindow() {
