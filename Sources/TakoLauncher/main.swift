@@ -3615,6 +3615,11 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         applyFilter()
     }
 
+    func updateApps(_ apps: [LaunchableApp]) {
+        self.apps = apps
+        applyFilter()
+    }
+
     func focusSearchField() {
         view.window?.makeFirstResponder(searchField)
     }
@@ -3834,6 +3839,28 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private struct ApplicationRefreshSnapshot {
+        let installedApps: [LaunchableApp]
+        let bookmarks: [LaunchableApp]
+        let audioDevices: [LaunchableApp]
+        let bluetoothDevices: [LaunchableApp]
+        let allCandidates: [LaunchableApp]
+        let lastScanDate: Date
+        let didRefreshInstalledSources: Bool
+        let startedAt: Date
+        let completedAt: Date
+        let installedSourcesDurationMilliseconds: Int
+        let audioDevicesDurationMilliseconds: Int
+        let bluetoothDevicesDurationMilliseconds: Int
+        let runningApplicationsDurationMilliseconds: Int
+    }
+
+    private struct LauncherCandidatePreparationResult {
+        let candidateCount: Int
+        let rawCandidateCount: Int
+        let hiddenCounts: [String: Int]
+    }
+
     private let launcherViewController = LauncherViewController()
     private let launchHistoryStore = LaunchHistoryStore()
     private var window: LauncherPanel?
@@ -3855,6 +3882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cachedBluetoothDevices: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
+    private var pendingApplicationRefreshWorkItem: DispatchWorkItem?
     private var previousFrontmostProcessIdentifier: pid_t?
     private var previousFrontmostWindowTitle: String?
     private var isRelaunchingFromReopen = false
@@ -4006,6 +4034,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        pendingApplicationRefreshWorkItem?.cancel()
+        pendingApplicationRefreshWorkItem = nil
+
         if let hotKeyRef {
             UnregisterEventHotKey(hotKeyRef)
         }
@@ -4615,27 +4646,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showLauncher() {
-        capturePreviousFrontmostWindow()
-        refreshApplications(force: false)
-        let actionableCandidateResult = actionableCandidates(from: cachedApps)
-        launcherViewController.prepareForPresentation(apps: actionableCandidateResult.candidates)
-        positionWindow()
-        AppLog.write("show_launcher", [
-            "candidate_count": actionableCandidateResult.candidates.count,
-            "raw_candidate_count": cachedApps.count,
-            "hidden_noop_candidates": actionableCandidateResult.hiddenCounts,
-            "previous_pid": logPID(previousFrontmostProcessIdentifier),
-            "previous_title": previousFrontmostWindowTitle ?? "nil"
-        ])
+        let startedAt = Date()
 
+        let captureStartedAt = Date()
+        capturePreviousFrontmostWindow()
+        let captureDurationMilliseconds = Self.elapsedMilliseconds(since: captureStartedAt)
+
+        let didRefreshSynchronously = cachedApps.isEmpty
+        var syncRefreshDurationMilliseconds: Int?
+        if didRefreshSynchronously {
+            let syncRefreshStartedAt = Date()
+            refreshApplications(force: false)
+            syncRefreshDurationMilliseconds = Self.elapsedMilliseconds(since: syncRefreshStartedAt)
+        }
+
+        let prepareStartedAt = Date()
+        let preparationResult = prepareLauncherCandidates(
+            resetSearch: true,
+            logEvent: "show_launcher"
+        )
+        let prepareDurationMilliseconds = Self.elapsedMilliseconds(since: prepareStartedAt)
+
+        let positionStartedAt = Date()
+        positionWindow()
+        let positionDurationMilliseconds = Self.elapsedMilliseconds(since: positionStartedAt)
+
+        let presentStartedAt = Date()
         presentLauncherWindow()
+        let presentDurationMilliseconds = Self.elapsedMilliseconds(since: presentStartedAt)
+
+        let monitorStartedAt = Date()
         installLauncherDismissMonitors()
+        let monitorDurationMilliseconds = Self.elapsedMilliseconds(since: monitorStartedAt)
+
+        AppLog.write("show_launcher_timing", [
+            "capture_previous_frontmost_window_ms": captureDurationMilliseconds,
+            "sync_refresh_ms": syncRefreshDurationMilliseconds ?? -1,
+            "prepare_candidates_ms": prepareDurationMilliseconds,
+            "position_window_ms": positionDurationMilliseconds,
+            "present_window_ms": presentDurationMilliseconds,
+            "install_dismiss_monitors_ms": monitorDurationMilliseconds,
+            "total_before_async_ms": Self.elapsedMilliseconds(since: startedAt),
+            "did_refresh_synchronously": didRefreshSynchronously,
+            "candidate_count": preparationResult.candidateCount,
+            "raw_candidate_count": preparationResult.rawCandidateCount,
+            "hidden_noop_candidates": preparationResult.hiddenCounts,
+            "window_visible": window?.isVisible ?? false,
+            "window_key": window?.isKeyWindow ?? false,
+            "app_active": NSApp.isActive
+        ])
 
         // The first presentation after launch can become visible without becoming key.
         // Re-present on the next pass after AppKit processes activation.
         DispatchQueue.main.async { [weak self] in
-            self?.presentLauncherWindow()
-            self?.launcherViewController.focusSearchField()
+            guard let self else {
+                return
+            }
+
+            let asyncStartedAt = Date()
+            self.presentLauncherWindow()
+            let asyncPresentDurationMilliseconds = Self.elapsedMilliseconds(since: asyncStartedAt)
+
+            let focusStartedAt = Date()
+            self.launcherViewController.focusSearchField()
+            let focusDurationMilliseconds = Self.elapsedMilliseconds(since: focusStartedAt)
+
+            AppLog.write("show_launcher_async_timing", [
+                "present_window_ms": asyncPresentDurationMilliseconds,
+                "focus_search_field_ms": focusDurationMilliseconds,
+                "total_since_show_start_ms": Self.elapsedMilliseconds(since: startedAt),
+                "window_visible": self.window?.isVisible ?? false,
+                "window_key": self.window?.isKeyWindow ?? false,
+                "app_active": NSApp.isActive
+            ])
+        }
+
+        if !didRefreshSynchronously {
+            scheduleApplicationRefreshAfterPresentation(
+                force: false,
+                updateVisibleLauncher: true
+            )
         }
     }
 
@@ -4765,21 +4855,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrameOrigin(origin)
     }
 
-    private func refreshApplications(force: Bool) {
-        if force || cachedInstalledApps.isEmpty || Date().timeIntervalSince(lastScanDate) > 30 {
-            cachedInstalledApps = AppDiscovery.loadInstalledApplications()
-            cachedBookmarks = AppPreferences.includeChromeBookmarks ?
-                ChromeBookmarkDiscovery.loadBookmarks() :
-                []
-            lastScanDate = Date()
+    @discardableResult
+    private func prepareLauncherCandidates(
+        resetSearch: Bool,
+        logEvent: String,
+        extraLogFields: [String: Any] = [:]
+    ) -> LauncherCandidatePreparationResult {
+        let actionableCandidateResult = actionableCandidates(from: cachedApps)
+
+        if resetSearch {
+            launcherViewController.prepareForPresentation(apps: actionableCandidateResult.candidates)
+        } else {
+            launcherViewController.updateApps(actionableCandidateResult.candidates)
         }
 
-        cachedAudioDevices = AudioDeviceDiscovery.loadDevices()
-        cachedBluetoothDevices = BluetoothDeviceDiscovery.loadDevices()
-        rebuildCandidateCache()
+        var logFields = extraLogFields
+        logFields["candidate_count"] = actionableCandidateResult.candidates.count
+        logFields["raw_candidate_count"] = cachedApps.count
+        logFields["hidden_noop_candidates"] = actionableCandidateResult.hiddenCounts
+        logFields["previous_pid"] = logPID(previousFrontmostProcessIdentifier)
+        logFields["previous_title"] = previousFrontmostWindowTitle ?? "nil"
+        AppLog.write(logEvent, logFields)
+
+        return LauncherCandidatePreparationResult(
+            candidateCount: actionableCandidateResult.candidates.count,
+            rawCandidateCount: cachedApps.count,
+            hiddenCounts: actionableCandidateResult.hiddenCounts
+        )
+    }
+
+    private func refreshApplications(force: Bool) {
+        let snapshot = makeApplicationRefreshSnapshot(force: force)
+        applyApplicationRefreshSnapshot(snapshot, force: force, source: "sync")
+    }
+
+    private func scheduleApplicationRefreshAfterPresentation(
+        force: Bool,
+        updateVisibleLauncher: Bool
+    ) {
+        pendingApplicationRefreshWorkItem?.cancel()
+        let scheduledAt = Date()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.pendingApplicationRefreshWorkItem = nil
+
+            let refreshStartedAt = Date()
+            self.refreshApplications(force: force)
+            let refreshDurationMilliseconds = Self.elapsedMilliseconds(since: refreshStartedAt)
+
+            if updateVisibleLauncher, self.window?.isVisible == true {
+                let scheduledDelayMilliseconds = Self.elapsedMilliseconds(since: scheduledAt)
+                let prepareStartedAt = Date()
+                let preparationResult = self.prepareLauncherCandidates(
+                    resetSearch: false,
+                    logEvent: "show_launcher_refreshed",
+                    extraLogFields: [
+                        "scheduled_delay_ms": scheduledDelayMilliseconds,
+                        "refresh_ms": refreshDurationMilliseconds
+                    ]
+                )
+                AppLog.write("show_launcher_refreshed_timing", [
+                    "scheduled_delay_ms": scheduledDelayMilliseconds,
+                    "refresh_ms": refreshDurationMilliseconds,
+                    "prepare_candidates_ms": Self.elapsedMilliseconds(since: prepareStartedAt),
+                    "candidate_count": preparationResult.candidateCount,
+                    "raw_candidate_count": preparationResult.rawCandidateCount,
+                    "hidden_noop_candidates": preparationResult.hiddenCounts
+                ])
+            } else {
+                AppLog.write("show_launcher_refresh_skipped_update", [
+                    "scheduled_delay_ms": Self.elapsedMilliseconds(since: scheduledAt),
+                    "refresh_ms": refreshDurationMilliseconds,
+                    "window_visible": self.window?.isVisible ?? false
+                ])
+            }
+        }
+
+        pendingApplicationRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
+    }
+
+    private static func elapsedMilliseconds(since startedAt: Date, until completedAt: Date = Date()) -> Int {
+        Int(completedAt.timeIntervalSince(startedAt) * 1000)
+    }
+
+    private func makeApplicationRefreshSnapshot(force: Bool) -> ApplicationRefreshSnapshot {
+        Self.makeApplicationRefreshSnapshot(
+            force: force,
+            installedApps: cachedInstalledApps,
+            bookmarks: cachedBookmarks,
+            lastScanDate: lastScanDate,
+            includeChromeBookmarks: AppPreferences.includeChromeBookmarks
+        )
+    }
+
+    private static func makeApplicationRefreshSnapshot(
+        force: Bool,
+        installedApps: [LaunchableApp],
+        bookmarks: [LaunchableApp],
+        lastScanDate: Date,
+        includeChromeBookmarks: Bool
+    ) -> ApplicationRefreshSnapshot {
+        let startedAt = Date()
+        let shouldRefreshInstalledSources =
+            force ||
+            installedApps.isEmpty ||
+            startedAt.timeIntervalSince(lastScanDate) > 30
+
+        let refreshedInstalledApps: [LaunchableApp]
+        let refreshedBookmarks: [LaunchableApp]
+        let refreshedLastScanDate: Date
+
+        let installedSourcesStartedAt = Date()
+        if shouldRefreshInstalledSources {
+            refreshedInstalledApps = AppDiscovery.loadInstalledApplications()
+            refreshedBookmarks = includeChromeBookmarks ?
+                ChromeBookmarkDiscovery.loadBookmarks() :
+                []
+            refreshedLastScanDate = Date()
+        } else {
+            refreshedInstalledApps = installedApps
+            refreshedBookmarks = bookmarks
+            refreshedLastScanDate = lastScanDate
+        }
+        let installedSourcesDurationMilliseconds = elapsedMilliseconds(since: installedSourcesStartedAt)
+
+        let audioDevicesStartedAt = Date()
+        let audioDevices = AudioDeviceDiscovery.loadDevices()
+        let audioDevicesDurationMilliseconds = elapsedMilliseconds(since: audioDevicesStartedAt)
+
+        let bluetoothDevicesStartedAt = Date()
+        let bluetoothDevices = BluetoothDeviceDiscovery.loadDevices()
+        let bluetoothDevicesDurationMilliseconds = elapsedMilliseconds(since: bluetoothDevicesStartedAt)
+
+        let runningApplicationsStartedAt = Date()
+        let runningApplications = AppDiscovery.includeRunningApplications(in: refreshedInstalledApps)
+        let runningApplicationsDurationMilliseconds = elapsedMilliseconds(since: runningApplicationsStartedAt)
+
+        let allCandidates = runningApplications +
+            refreshedBookmarks +
+            audioDevices +
+            bluetoothDevices
+
+        return ApplicationRefreshSnapshot(
+            installedApps: refreshedInstalledApps,
+            bookmarks: refreshedBookmarks,
+            audioDevices: audioDevices,
+            bluetoothDevices: bluetoothDevices,
+            allCandidates: allCandidates,
+            lastScanDate: refreshedLastScanDate,
+            didRefreshInstalledSources: shouldRefreshInstalledSources,
+            startedAt: startedAt,
+            completedAt: Date(),
+            installedSourcesDurationMilliseconds: installedSourcesDurationMilliseconds,
+            audioDevicesDurationMilliseconds: audioDevicesDurationMilliseconds,
+            bluetoothDevicesDurationMilliseconds: bluetoothDevicesDurationMilliseconds,
+            runningApplicationsDurationMilliseconds: runningApplicationsDurationMilliseconds
+        )
+    }
+
+    private func applyApplicationRefreshSnapshot(
+        _ snapshot: ApplicationRefreshSnapshot,
+        force: Bool,
+        source: String
+    ) {
+        cachedInstalledApps = snapshot.installedApps
+        cachedBookmarks = snapshot.bookmarks
+        cachedAudioDevices = snapshot.audioDevices
+        cachedBluetoothDevices = snapshot.bluetoothDevices
+        cachedApps = snapshot.allCandidates
+        lastScanDate = snapshot.lastScanDate
+
         AppLog.write("refresh_applications", [
             "force": force,
+            "source": source,
             "include_chrome_bookmarks": AppPreferences.includeChromeBookmarks,
+            "refreshed_installed_sources": snapshot.didRefreshInstalledSources,
+            "duration_ms": Int(snapshot.completedAt.timeIntervalSince(snapshot.startedAt) * 1000),
+            "installed_sources_ms": snapshot.installedSourcesDurationMilliseconds,
+            "audio_devices_ms": snapshot.audioDevicesDurationMilliseconds,
+            "bluetooth_devices_ms": snapshot.bluetoothDevicesDurationMilliseconds,
+            "running_applications_ms": snapshot.runningApplicationsDurationMilliseconds,
             "installed_candidates": cachedInstalledApps.count,
             "bookmark_candidates": cachedBookmarks.count,
             "audio_device_candidates": cachedAudioDevices.count,
