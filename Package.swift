@@ -11,6 +11,12 @@ let package = Package(
         .executable(name: "Tendon", targets: ["Tendon"])
     ],
     targets: [
-        .executableTarget(name: "Tendon", path: "Sources/TakoLauncher")
+        .executableTarget(
+            name: "Tendon",
+            path: "Sources/TakoLauncher",
+            linkerSettings: [
+                .linkedLibrary("sqlite3")
+            ]
+        )
     ]
 )

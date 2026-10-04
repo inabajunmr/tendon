@@ -6,7 +6,10 @@ import Darwin
 import IOBluetooth
 import IOKit
 import ServiceManagement
+import SQLite3
 import UniformTypeIdentifiers
+
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 private struct CoreGraphicsWindowInfo {
     let identifier: UInt32?
@@ -747,6 +750,7 @@ private enum ChromeBookmarkDiscovery {
     static func loadBookmarks(fileManager: FileManager = .default) -> [LaunchableApp] {
         var seenURLs = Set<String>()
         var bookmarks: [LaunchableApp] = []
+        var bookmarkedURLStringsByProfileDirectory: [URL: Set<String>] = [:]
 
         for bookmarksFileURL in bookmarkFileURLs(fileManager: fileManager) {
             guard
@@ -757,6 +761,8 @@ private enum ChromeBookmarkDiscovery {
             }
 
             let profileName = bookmarksFileURL.deletingLastPathComponent().lastPathComponent
+            let profileDirectoryURL = bookmarksFileURL.deletingLastPathComponent()
+            var bookmarkedURLStrings = Set<String>()
 
             for root in bookmarkFile.roots.values {
                 appendBookmarks(
@@ -764,10 +770,21 @@ private enum ChromeBookmarkDiscovery {
                     folderPath: [],
                     profileName: profileName,
                     seenURLs: &seenURLs,
+                    bookmarkedURLStrings: &bookmarkedURLStrings,
                     bookmarks: &bookmarks
                 )
             }
+
+            if !bookmarkedURLStrings.isEmpty {
+                bookmarkedURLStringsByProfileDirectory[profileDirectoryURL, default: []]
+                    .formUnion(bookmarkedURLStrings)
+            }
         }
+
+        ChromeFaviconStore.shared.reload(
+            bookmarkedURLStringsByProfileDirectory: bookmarkedURLStringsByProfileDirectory,
+            fileManager: fileManager
+        )
 
         return bookmarks.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
@@ -818,6 +835,7 @@ private enum ChromeBookmarkDiscovery {
         folderPath: [String],
         profileName: String,
         seenURLs: inout Set<String>,
+        bookmarkedURLStrings: inout Set<String>,
         bookmarks: inout [LaunchableApp]
     ) {
         switch node.type {
@@ -831,6 +849,8 @@ private enum ChromeBookmarkDiscovery {
             }
 
             let normalizedURL = url.absoluteString
+            bookmarkedURLStrings.insert(normalizedURL)
+
             guard !seenURLs.contains(normalizedURL) else {
                 return
             }
@@ -879,6 +899,7 @@ private enum ChromeBookmarkDiscovery {
                     folderPath: nextFolderPath,
                     profileName: profileName,
                     seenURLs: &seenURLs,
+                    bookmarkedURLStrings: &bookmarkedURLStrings,
                     bookmarks: &bookmarks
                 )
             }
@@ -907,6 +928,462 @@ private enum ChromeBookmarkDiscovery {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+}
+
+private final class ChromeFaviconStore {
+    private struct DatabaseOpenResult {
+        let database: OpaquePointer?
+        let method: String
+        let resultCode: Int32
+        let message: String
+    }
+
+    private struct ProfileLoadResult {
+        let profileName: String
+        let databaseExists: Bool
+        let openMethod: String
+        let openResultCode: Int32
+        let openMessage: String
+        let prepareResultCode: Int32?
+        let prepareMessage: String?
+        let iconMappingCount: Int?
+        let faviconBitmapCount: Int?
+        let bookmarkURLCount: Int
+        let matchedBookmarkCount: Int
+        let missingBookmarkCount: Int
+        let cachedURLKeyCount: Int
+        let matchedSampleHosts: [String]
+        let missingSampleHosts: [String]
+
+        var logFields: [String: Any] {
+            var fields: [String: Any] = [
+                "profile": profileName,
+                "database_exists": databaseExists,
+                "open_method": openMethod,
+                "open_result_code": Int(openResultCode),
+                "open_message": openMessage,
+                "bookmark_url_count": bookmarkURLCount,
+                "matched_bookmark_count": matchedBookmarkCount,
+                "missing_bookmark_count": missingBookmarkCount,
+                "cached_url_key_count": cachedURLKeyCount,
+                "matched_sample_hosts": matchedSampleHosts,
+                "missing_sample_hosts": missingSampleHosts
+            ]
+
+            if let prepareResultCode {
+                fields["prepare_result_code"] = Int(prepareResultCode)
+            }
+            if let prepareMessage {
+                fields["prepare_message"] = prepareMessage
+            }
+            if let iconMappingCount {
+                fields["icon_mapping_count"] = iconMappingCount
+            }
+            if let faviconBitmapCount {
+                fields["favicon_bitmap_count"] = faviconBitmapCount
+            }
+
+            return fields
+        }
+    }
+
+    static let shared = ChromeFaviconStore()
+
+    private let lock = NSLock()
+    private var faviconDataByPageURLString: [String: Data] = [:]
+    private var faviconImageByPageURLString: [String: NSImage] = [:]
+
+    func reload(
+        bookmarkedURLStringsByProfileDirectory: [URL: Set<String>],
+        fileManager: FileManager = .default
+    ) {
+        let startedAt = Date()
+        var reloadedData: [String: Data] = [:]
+        var profileResults: [ProfileLoadResult] = []
+
+        for (profileDirectoryURL, bookmarkedURLStrings) in bookmarkedURLStringsByProfileDirectory {
+            let profileResult = loadFavicons(
+                profileDirectoryURL: profileDirectoryURL,
+                bookmarkedURLStrings: bookmarkedURLStrings,
+                fileManager: fileManager,
+                into: &reloadedData
+            )
+            profileResults.append(profileResult)
+        }
+
+        lock.lock()
+        faviconDataByPageURLString = reloadedData
+        faviconImageByPageURLString = [:]
+        lock.unlock()
+
+        AppLog.write("chrome_favicon_reload", [
+            "profile_count": profileResults.count,
+            "bookmark_url_count": profileResults.reduce(0) { $0 + $1.bookmarkURLCount },
+            "matched_bookmark_count": profileResults.reduce(0) { $0 + $1.matchedBookmarkCount },
+            "missing_bookmark_count": profileResults.reduce(0) { $0 + $1.missingBookmarkCount },
+            "cached_url_key_count": reloadedData.count,
+            "duration_ms": Int(Date().timeIntervalSince(startedAt) * 1000),
+            "profiles": profileResults.map(\.logFields)
+        ])
+    }
+
+    func image(for pageURL: URL) -> NSImage? {
+        let pageURLStrings = faviconLookupURLStrings(for: pageURL.absoluteString)
+
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        for pageURLString in pageURLStrings {
+            if let image = faviconImageByPageURLString[pageURLString] {
+                return image
+            }
+
+            guard
+                let faviconData = faviconDataByPageURLString[pageURLString],
+                let image = NSImage(data: faviconData)
+            else {
+                continue
+            }
+
+            faviconImageByPageURLString[pageURLString] = image
+            return image
+        }
+
+        return nil
+    }
+
+    private func loadFavicons(
+        profileDirectoryURL: URL,
+        bookmarkedURLStrings: Set<String>,
+        fileManager: FileManager,
+        into faviconDataByPageURLString: inout [String: Data]
+    ) -> ProfileLoadResult {
+        let profileName = profileDirectoryURL.lastPathComponent
+        let faviconsDatabaseURL = profileDirectoryURL.appendingPathComponent("Favicons")
+        guard fileManager.fileExists(atPath: faviconsDatabaseURL.path) else {
+            return ProfileLoadResult(
+                profileName: profileName,
+                databaseExists: false,
+                openMethod: "not_attempted",
+                openResultCode: SQLITE_NOTFOUND,
+                openMessage: "Favicons database not found",
+                prepareResultCode: nil,
+                prepareMessage: nil,
+                iconMappingCount: nil,
+                faviconBitmapCount: nil,
+                bookmarkURLCount: bookmarkedURLStrings.count,
+                matchedBookmarkCount: 0,
+                missingBookmarkCount: bookmarkedURLStrings.count,
+                cachedURLKeyCount: 0,
+                matchedSampleHosts: [],
+                missingSampleHosts: sampleHosts(from: bookmarkedURLStrings)
+            )
+        }
+
+        let openResult = openFaviconsDatabase(at: faviconsDatabaseURL)
+        guard openResult.resultCode == SQLITE_OK, let database = openResult.database else {
+            return ProfileLoadResult(
+                profileName: profileName,
+                databaseExists: true,
+                openMethod: openResult.method,
+                openResultCode: openResult.resultCode,
+                openMessage: openResult.message,
+                prepareResultCode: nil,
+                prepareMessage: nil,
+                iconMappingCount: nil,
+                faviconBitmapCount: nil,
+                bookmarkURLCount: bookmarkedURLStrings.count,
+                matchedBookmarkCount: 0,
+                missingBookmarkCount: bookmarkedURLStrings.count,
+                cachedURLKeyCount: 0,
+                matchedSampleHosts: [],
+                missingSampleHosts: sampleHosts(from: bookmarkedURLStrings)
+            )
+        }
+        defer {
+            sqlite3_close(database)
+        }
+
+        let iconMappingCount = scalarInt(database: database, sql: "SELECT COUNT(*) FROM icon_mapping")
+        let faviconBitmapCount = scalarInt(database: database, sql: "SELECT COUNT(*) FROM favicon_bitmaps")
+
+        let exactSQL = """
+            SELECT b.image_data
+            FROM icon_mapping AS m
+            JOIN favicon_bitmaps AS b ON b.icon_id = m.icon_id
+            WHERE m.page_url = ?
+            ORDER BY b.width DESC, b.height DESC
+            LIMIT 1
+            """
+        var exactStatement: OpaquePointer?
+        let prepareResultCode = sqlite3_prepare_v2(database, exactSQL, -1, &exactStatement, nil)
+        guard prepareResultCode == SQLITE_OK else {
+            return ProfileLoadResult(
+                profileName: profileName,
+                databaseExists: true,
+                openMethod: openResult.method,
+                openResultCode: openResult.resultCode,
+                openMessage: openResult.message,
+                prepareResultCode: prepareResultCode,
+                prepareMessage: sqliteMessage(database: database, resultCode: prepareResultCode),
+                iconMappingCount: iconMappingCount,
+                faviconBitmapCount: faviconBitmapCount,
+                bookmarkURLCount: bookmarkedURLStrings.count,
+                matchedBookmarkCount: 0,
+                missingBookmarkCount: bookmarkedURLStrings.count,
+                cachedURLKeyCount: 0,
+                matchedSampleHosts: [],
+                missingSampleHosts: sampleHosts(from: bookmarkedURLStrings)
+            )
+        }
+        defer {
+            sqlite3_finalize(exactStatement)
+        }
+
+        var matchedBookmarkCount = 0
+        var missingBookmarkCount = 0
+        var cachedURLKeyCount = 0
+        var matchedSampleHosts: [String] = []
+        var missingSampleHosts: [String] = []
+
+        for bookmarkedURLString in bookmarkedURLStrings {
+            guard faviconDataByPageURLString[bookmarkedURLString] == nil else {
+                continue
+            }
+
+            let lookupURLStrings = faviconLookupURLStrings(for: bookmarkedURLString)
+            if let faviconData = firstFaviconData(
+                lookupURLStrings: lookupURLStrings,
+                statement: exactStatement
+            ) {
+                matchedBookmarkCount += 1
+                appendSampleHost(from: bookmarkedURLString, to: &matchedSampleHosts)
+
+                for lookupURLString in lookupURLStrings {
+                    if faviconDataByPageURLString[lookupURLString] == nil {
+                        cachedURLKeyCount += 1
+                    }
+                    faviconDataByPageURLString[lookupURLString] = faviconData
+                }
+                if faviconDataByPageURLString[bookmarkedURLString] == nil {
+                    cachedURLKeyCount += 1
+                }
+                faviconDataByPageURLString[bookmarkedURLString] = faviconData
+                continue
+            }
+
+            missingBookmarkCount += 1
+            appendSampleHost(from: bookmarkedURLString, to: &missingSampleHosts)
+        }
+
+        return ProfileLoadResult(
+            profileName: profileName,
+            databaseExists: true,
+            openMethod: openResult.method,
+            openResultCode: openResult.resultCode,
+            openMessage: openResult.message,
+            prepareResultCode: prepareResultCode,
+            prepareMessage: sqliteMessage(database: database, resultCode: prepareResultCode),
+            iconMappingCount: iconMappingCount,
+            faviconBitmapCount: faviconBitmapCount,
+            bookmarkURLCount: bookmarkedURLStrings.count,
+            matchedBookmarkCount: matchedBookmarkCount,
+            missingBookmarkCount: missingBookmarkCount,
+            cachedURLKeyCount: cachedURLKeyCount,
+            matchedSampleHosts: matchedSampleHosts,
+            missingSampleHosts: missingSampleHosts
+        )
+    }
+
+    private func openFaviconsDatabase(at databaseURL: URL) -> DatabaseOpenResult {
+        var database: OpaquePointer?
+        let normalResultCode = sqlite3_open_v2(
+            databaseURL.path,
+            &database,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+            nil
+        )
+        if normalResultCode == SQLITE_OK {
+            return DatabaseOpenResult(
+                database: database,
+                method: "readonly",
+                resultCode: normalResultCode,
+                message: sqliteMessage(database: database, resultCode: normalResultCode)
+            )
+        }
+
+        let normalMessage = sqliteMessage(database: database, resultCode: normalResultCode)
+        if let database {
+            sqlite3_close(database)
+        }
+
+        database = nil
+        let immutableURI = "\(databaseURL.absoluteString)?mode=ro&immutable=1"
+        let immutableResultCode = sqlite3_open_v2(
+            immutableURI,
+            &database,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI,
+            nil
+        )
+        if immutableResultCode == SQLITE_OK {
+            return DatabaseOpenResult(
+                database: database,
+                method: "immutable_uri_after_\(normalResultCode)",
+                resultCode: immutableResultCode,
+                message: "regular open failed: \(normalMessage)"
+            )
+        }
+
+        let immutableMessage = sqliteMessage(database: database, resultCode: immutableResultCode)
+        if let database {
+            sqlite3_close(database)
+        }
+
+        return DatabaseOpenResult(
+            database: nil,
+            method: "immutable_uri_after_\(normalResultCode)",
+            resultCode: immutableResultCode,
+            message: "regular open failed: \(normalMessage); immutable open failed: \(immutableMessage)"
+        )
+    }
+
+    private func firstFaviconData(
+        lookupURLStrings: [String],
+        statement: OpaquePointer?
+    ) -> Data? {
+        for lookupURLString in lookupURLStrings {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, lookupURLString, -1, sqliteTransient)
+
+            if sqlite3_step(statement) == SQLITE_ROW,
+               let faviconData = dataFromColumn(statement: statement, column: 0) {
+                return faviconData
+            }
+        }
+
+        return nil
+    }
+
+    private func dataFromColumn(statement: OpaquePointer?, column: Int32) -> Data? {
+        guard
+            let bytes = sqlite3_column_blob(statement, column),
+            sqlite3_column_bytes(statement, column) > 0
+        else {
+            return nil
+        }
+
+        return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, column)))
+    }
+
+    private func scalarInt(database: OpaquePointer, sql: String) -> Int? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return nil
+        }
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func sqliteMessage(database: OpaquePointer?, resultCode: Int32) -> String {
+        if let database, let message = sqlite3_errmsg(database) {
+            return String(cString: message)
+        }
+
+        return String(cString: sqlite3_errstr(resultCode))
+    }
+
+    private func sampleHosts(from urlStrings: Set<String>, limit: Int = 5) -> [String] {
+        var hosts: [String] = []
+
+        for urlString in urlStrings.sorted() {
+            appendSampleHost(from: urlString, to: &hosts, limit: limit)
+            if hosts.count >= limit {
+                break
+            }
+        }
+
+        return hosts
+    }
+
+    private func appendSampleHost(from urlString: String, to hosts: inout [String], limit: Int = 5) {
+        guard hosts.count < limit else {
+            return
+        }
+
+        let host = URLComponents(string: urlString)?.host ?? urlString
+        guard !hosts.contains(host) else {
+            return
+        }
+
+        hosts.append(host)
+    }
+}
+
+private func faviconLookupURLStrings(for urlString: String) -> [String] {
+    var lookupURLStrings: [String] = []
+
+    func append(_ candidate: String?) {
+        guard
+            let candidate,
+            !candidate.isEmpty,
+            !lookupURLStrings.contains(candidate)
+        else {
+            return
+        }
+
+        lookupURLStrings.append(candidate)
+    }
+
+    append(urlString)
+
+    guard var components = URLComponents(string: urlString) else {
+        return lookupURLStrings
+    }
+
+    components.fragment = nil
+    append(components.string)
+
+    components.query = nil
+    append(components.string)
+
+    if components.path.isEmpty {
+        components.path = "/"
+        append(components.string)
+    } else if components.path == "/" {
+        components.path = ""
+        append(components.string)
+    }
+
+    for originURLString in faviconOriginURLStrings(for: components) {
+        append(originURLString)
+    }
+
+    return lookupURLStrings
+}
+
+private func faviconOriginURLStrings(for components: URLComponents) -> [String] {
+    guard
+        let scheme = components.scheme,
+        let host = components.host
+    else {
+        return []
+    }
+
+    var origin = "\(scheme)://\(host)"
+    if let port = components.port {
+        origin += ":\(port)"
+    }
+    return ["\(origin)/", origin]
 }
 
 private enum AudioDeviceDiscovery {
@@ -3223,7 +3700,8 @@ final class AppCellView: NSTableCellView {
         } else if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
             appIconView.image = audioIcon
         } else if app.targetKind == .bookmark {
-            appIconView.image = NSWorkspace.shared.icon(for: .url)
+            appIconView.image = app.url.flatMap { ChromeFaviconStore.shared.image(for: $0) } ??
+                NSWorkspace.shared.icon(for: .url)
         } else if let url = app.url {
             appIconView.image = NSWorkspace.shared.icon(forFile: url.path)
         } else if
