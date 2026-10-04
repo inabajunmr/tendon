@@ -11,6 +11,42 @@ import UniformTypeIdentifiers
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+enum LauncherHotKey: String, CaseIterable {
+    case optionN = "option-n"
+    case optionSpace = "option-space"
+
+    static let defaultValue: LauncherHotKey = .optionN
+
+    var displayName: String {
+        switch self {
+        case .optionN:
+            return "Option+N"
+        case .optionSpace:
+            return "Option+Space"
+        }
+    }
+
+    var keyCode: UInt32 {
+        switch self {
+        case .optionN:
+            return UInt32(kVK_ANSI_N)
+        case .optionSpace:
+            return UInt32(kVK_Space)
+        }
+    }
+
+    var carbonModifiers: UInt32 {
+        UInt32(optionKey)
+    }
+
+    func matches(keyCode: UInt16, hasOption: Bool, hasCommand: Bool, hasControl: Bool) -> Bool {
+        UInt32(keyCode) == self.keyCode &&
+            hasOption &&
+            !hasCommand &&
+            !hasControl
+    }
+}
+
 private struct CoreGraphicsWindowInfo {
     let identifier: UInt32?
     let ownerProcessIdentifier: pid_t
@@ -3793,6 +3829,7 @@ final class AppCellView: NSTableCellView {
 final class PreferencesViewController: NSViewController {
     var onIncludeChromeBookmarksChanged: ((Bool) -> Void)?
     var onLaunchAtLoginChanged: ((Bool) -> Void)?
+    var onLauncherHotKeyChanged: ((LauncherHotKey) -> Void)?
     var onRestoreHiddenCandidate: ((HiddenCandidate) -> Void)?
 
     private let includeChromeBookmarksButton = NSButton(
@@ -3800,6 +3837,8 @@ final class PreferencesViewController: NSViewController {
         target: nil,
         action: nil
     )
+    private let launcherHotKeyLabel = NSTextField(labelWithString: "Show/hide Tendon")
+    private let launcherHotKeyMenu = NSPopUpButton(frame: .zero, pullsDown: false)
     private let launchAtLoginButton = NSButton(
         checkboxWithTitle: "Launch at login",
         target: nil,
@@ -3814,10 +3853,17 @@ final class PreferencesViewController: NSViewController {
     )
     private var hiddenCandidates: [HiddenCandidate] = []
 
-    init(includeChromeBookmarks: Bool, launchAtLogin: Bool, hiddenCandidates: [HiddenCandidate]) {
+    init(
+        includeChromeBookmarks: Bool,
+        launchAtLogin: Bool,
+        launcherHotKey: LauncherHotKey,
+        hiddenCandidates: [HiddenCandidate]
+    ) {
         super.init(nibName: nil, bundle: nil)
         includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
         launchAtLoginButton.state = launchAtLogin ? .on : .off
+        configureLauncherHotKeyMenu()
+        setLauncherHotKey(launcherHotKey)
         setHiddenCandidates(hiddenCandidates)
     }
 
@@ -3826,7 +3872,7 @@ final class PreferencesViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 284))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 344))
     }
 
     override func viewDidLoad() {
@@ -3840,6 +3886,10 @@ final class PreferencesViewController: NSViewController {
 
     func setLaunchAtLogin(_ launchAtLogin: Bool) {
         launchAtLoginButton.state = launchAtLogin ? .on : .off
+    }
+
+    func setLauncherHotKey(_ launcherHotKey: LauncherHotKey) {
+        launcherHotKeyMenu.selectItem(withTitle: launcherHotKey.displayName)
     }
 
     func setHiddenCandidates(_ hiddenCandidates: [HiddenCandidate]) {
@@ -3864,12 +3914,20 @@ final class PreferencesViewController: NSViewController {
 
     private func setup() {
         let sourcesLabel = sectionLabel("Sources")
+        let shortcutLabel = sectionLabel("Shortcut")
         let startupLabel = sectionLabel("Startup")
         let hiddenItemsLabel = sectionLabel("Hidden Items")
 
         includeChromeBookmarksButton.translatesAutoresizingMaskIntoConstraints = false
         includeChromeBookmarksButton.target = self
         includeChromeBookmarksButton.action = #selector(toggleIncludeChromeBookmarks(_:))
+
+        launcherHotKeyLabel.translatesAutoresizingMaskIntoConstraints = false
+        launcherHotKeyLabel.textColor = .secondaryLabelColor
+
+        launcherHotKeyMenu.translatesAutoresizingMaskIntoConstraints = false
+        launcherHotKeyMenu.target = self
+        launcherHotKeyMenu.action = #selector(changeLauncherHotKey(_:))
 
         launchAtLoginButton.translatesAutoresizingMaskIntoConstraints = false
         launchAtLoginButton.target = self
@@ -3886,6 +3944,9 @@ final class PreferencesViewController: NSViewController {
 
         view.addSubview(sourcesLabel)
         view.addSubview(includeChromeBookmarksButton)
+        view.addSubview(shortcutLabel)
+        view.addSubview(launcherHotKeyLabel)
+        view.addSubview(launcherHotKeyMenu)
         view.addSubview(startupLabel)
         view.addSubview(launchAtLoginButton)
         view.addSubview(hiddenItemsLabel)
@@ -3902,9 +3963,21 @@ final class PreferencesViewController: NSViewController {
             includeChromeBookmarksButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
             includeChromeBookmarksButton.topAnchor.constraint(equalTo: sourcesLabel.bottomAnchor, constant: 14),
 
+            shortcutLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            shortcutLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            shortcutLabel.topAnchor.constraint(equalTo: includeChromeBookmarksButton.bottomAnchor, constant: 24),
+
+            launcherHotKeyLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            launcherHotKeyLabel.centerYAnchor.constraint(equalTo: launcherHotKeyMenu.centerYAnchor),
+
+            launcherHotKeyMenu.leadingAnchor.constraint(equalTo: launcherHotKeyLabel.trailingAnchor, constant: 14),
+            launcherHotKeyMenu.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
+            launcherHotKeyMenu.topAnchor.constraint(equalTo: shortcutLabel.bottomAnchor, constant: 10),
+            launcherHotKeyMenu.widthAnchor.constraint(equalToConstant: 164),
+
             startupLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
             startupLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
-            startupLabel.topAnchor.constraint(equalTo: includeChromeBookmarksButton.bottomAnchor, constant: 24),
+            startupLabel.topAnchor.constraint(equalTo: launcherHotKeyMenu.bottomAnchor, constant: 24),
 
             launchAtLoginButton.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
             launchAtLoginButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
@@ -3935,12 +4008,32 @@ final class PreferencesViewController: NSViewController {
         return label
     }
 
+    private func configureLauncherHotKeyMenu() {
+        launcherHotKeyMenu.removeAllItems()
+
+        for hotKey in LauncherHotKey.allCases {
+            launcherHotKeyMenu.addItem(withTitle: hotKey.displayName)
+            launcherHotKeyMenu.lastItem?.representedObject = hotKey.rawValue
+        }
+    }
+
     @objc private func toggleIncludeChromeBookmarks(_ sender: NSButton) {
         onIncludeChromeBookmarksChanged?(sender.state == .on)
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
         onLaunchAtLoginChanged?(sender.state == .on)
+    }
+
+    @objc private func changeLauncherHotKey(_ sender: NSPopUpButton) {
+        guard
+            let rawValue = sender.selectedItem?.representedObject as? String,
+            let launcherHotKey = LauncherHotKey(rawValue: rawValue)
+        else {
+            return
+        }
+
+        onLauncherHotKeyChanged?(launcherHotKey)
     }
 
     private func hiddenCandidateTitle(_ candidate: HiddenCandidate) -> String {
@@ -3970,19 +4063,22 @@ final class PreferencesWindowController: NSWindowController {
     init(
         includeChromeBookmarks: Bool,
         launchAtLogin: Bool,
+        launcherHotKey: LauncherHotKey,
         hiddenCandidates: [HiddenCandidate],
         onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void,
         onLaunchAtLoginChanged: @escaping (Bool) -> Void,
+        onLauncherHotKeyChanged: @escaping (LauncherHotKey) -> Void,
         onRestoreHiddenCandidate: @escaping (HiddenCandidate) -> Void
     ) {
         self.preferencesViewController = PreferencesViewController(
             includeChromeBookmarks: includeChromeBookmarks,
             launchAtLogin: launchAtLogin,
+            launcherHotKey: launcherHotKey,
             hiddenCandidates: hiddenCandidates
         )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 284),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 344),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -3995,6 +4091,7 @@ final class PreferencesWindowController: NSWindowController {
         super.init(window: window)
         preferencesViewController.onIncludeChromeBookmarksChanged = onIncludeChromeBookmarksChanged
         preferencesViewController.onLaunchAtLoginChanged = onLaunchAtLoginChanged
+        preferencesViewController.onLauncherHotKeyChanged = onLauncherHotKeyChanged
         preferencesViewController.onRestoreHiddenCandidate = onRestoreHiddenCandidate
     }
 
@@ -4005,6 +4102,7 @@ final class PreferencesWindowController: NSWindowController {
     func syncFromPreferences() {
         preferencesViewController.setIncludeChromeBookmarks(AppPreferences.includeChromeBookmarks)
         preferencesViewController.setLaunchAtLogin(LoginItemManager.isEnabled)
+        preferencesViewController.setLauncherHotKey(AppPreferences.launcherHotKey)
         preferencesViewController.setHiddenCandidates(AppPreferences.hiddenCandidates)
     }
 }
@@ -4641,6 +4739,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ensureHotKeyInfrastructure(reason: "startup")
     }
 
+    private func unregisterCarbonHotKey(reason: String) {
+        guard let hotKeyRef else {
+            return
+        }
+
+        let status = UnregisterEventHotKey(hotKeyRef)
+        self.hotKeyRef = nil
+        AppLog.write("hotkey_unregister", [
+            "reason": reason,
+            "status": Int(status)
+        ])
+    }
+
+    private func applyLauncherHotKeyPreference(_ launcherHotKey: LauncherHotKey) {
+        guard AppPreferences.launcherHotKey != launcherHotKey else {
+            return
+        }
+
+        AppPreferences.launcherHotKey = launcherHotKey
+        unregisterCarbonHotKey(reason: "preferences_changed")
+        ensureHotKeyInfrastructure(reason: "preferences_changed")
+    }
+
     private func carbonHotKeyTarget() -> EventTargetRef {
         GetEventDispatcherTarget()
     }
@@ -4772,11 +4893,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let launcherHotKey = AppPreferences.launcherHotKey
         let hotKeyID = EventHotKeyID(signature: fourCharacterCode("TNDN"), id: 1)
         var registeredHotKeyRef: EventHotKeyRef?
         let registerStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_N),
-            UInt32(optionKey),
+            launcherHotKey.keyCode,
+            launcherHotKey.carbonModifiers,
             hotKeyID,
             carbonHotKeyTarget(),
             0,
@@ -4786,14 +4908,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLog.write("hotkey_register", [
             "reason": reason,
             "status": Int(registerStatus),
-            "key_code": Int(kVK_ANSI_N),
-            "modifiers": Int(optionKey),
+            "hotkey": launcherHotKey.displayName,
+            "key_code": Int(launcherHotKey.keyCode),
+            "modifiers": Int(launcherHotKey.carbonModifiers),
             "target": "event_dispatcher"
         ])
 
         if registerStatus != noErr {
             hotKeyRef = nil
-            reportHotKeyFailure(status: registerStatus)
+            reportHotKeyFailure(status: registerStatus, hotKey: launcherHotKey)
             return
         }
 
@@ -4985,10 +5108,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hasCommand: Bool,
         hasControl: Bool
     ) -> Bool {
-        keyCode == UInt16(kVK_ANSI_N) &&
-            hasOption &&
-            !hasCommand &&
-            !hasControl
+        AppPreferences.launcherHotKey.matches(
+            keyCode: keyCode,
+            hasOption: hasOption,
+            hasCommand: hasCommand,
+            hasControl: hasControl
+        )
     }
 
     private func handleHotKeyEventTapDisabled(_ type: CGEventType) {
@@ -5044,13 +5169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItemButton(button)
     }
 
-    private func reportHotKeyFailure(status: OSStatus) {
-        fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
+    private func reportHotKeyFailure(status: OSStatus, hotKey: LauncherHotKey = AppPreferences.launcherHotKey) {
+        fputs("Failed to register \(hotKey.displayName) hotkey: \(status)\n", stderr)
         AppLog.write("hotkey_register_failed", [
-            "status": Int(status)
+            "status": Int(status),
+            "hotkey": hotKey.displayName
         ])
         statusItem?.button?.title = "Tendon!"
-        statusItem?.button?.toolTip = "Option+N could not be registered"
+        statusItem?.button?.toolTip = "\(hotKey.displayName) could not be registered"
     }
 
     @objc private func quitFromMenu() {
@@ -5065,6 +5191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             preferencesWindowController = PreferencesWindowController(
                 includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
                 launchAtLogin: LoginItemManager.isEnabled,
+                launcherHotKey: AppPreferences.launcherHotKey,
                 hiddenCandidates: AppPreferences.hiddenCandidates,
                 onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
                     AppPreferences.includeChromeBookmarks = includeChromeBookmarks
@@ -5090,6 +5217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self?.preferencesWindowController?.syncFromPreferences()
+                },
+                onLauncherHotKeyChanged: { [weak self] launcherHotKey in
+                    self?.applyLauncherHotKeyPreference(launcherHotKey)
+                    self?.preferencesWindowController?.syncFromPreferences()
+                    AppLog.write("preferences_changed", [
+                        "launcher_hotkey": launcherHotKey.rawValue
+                    ])
                 },
                 onRestoreHiddenCandidate: { [weak self] candidate in
                     AppPreferences.restoreHiddenCandidate(candidate)

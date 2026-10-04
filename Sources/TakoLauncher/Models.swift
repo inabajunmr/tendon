@@ -12,6 +12,7 @@ struct HiddenCandidate: Codable, Hashable {
 enum AppPreferences {
     private static let includeChromeBookmarksKey = "includeChromeBookmarks"
     private static let didApplyLaunchAtLoginDefaultKey = "didApplyLaunchAtLoginDefault"
+    private static let launcherHotKeyKey = "launcherHotKey"
     private static let hiddenCandidateKeysKey = "hiddenCandidateKeys"
     private static let hiddenCandidatesKey = "hiddenCandidates"
 
@@ -34,6 +35,22 @@ enum AppPreferences {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: didApplyLaunchAtLoginDefaultKey)
+        }
+    }
+
+    static var launcherHotKey: LauncherHotKey {
+        get {
+            guard
+                let rawValue = UserDefaults.standard.string(forKey: launcherHotKeyKey),
+                let hotKey = LauncherHotKey(rawValue: rawValue)
+            else {
+                return .defaultValue
+            }
+
+            return hotKey
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: launcherHotKeyKey)
         }
     }
 

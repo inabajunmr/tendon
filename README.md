@@ -10,8 +10,9 @@ Small macOS app for opening apps, windows, and bookmarks quickly.
 swift run Tendon
 ```
 
-The app lives in the menu bar as `Tendon`. Press `Option+N` to show or hide it.
-Open `Preferences...` from the menu bar item to choose whether Chrome bookmarks are included.
+The app lives in the menu bar as `Tendon`. Press `Option+N` to show or hide it by default.
+Open `Preferences...` from the menu bar item to choose the launcher shortcut and whether Chrome
+bookmarks are included.
 
 ## Package as an app bundle
 
@@ -88,7 +89,7 @@ Open, or use the "Open Anyway" button in System Settings -> Privacy & Security.
 
 ## Controls
 
-- `Option+N`: show or hide Tendon
+- `Option+N` or `Option+Space`: show or hide Tendon, depending on the selected preference
 - Type to filter candidates case-insensitively
 - `Command+A`: select all text in the search field
 - `Up` / `Down`: move selection
