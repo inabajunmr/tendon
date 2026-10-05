@@ -11,6 +11,15 @@ import UniformTypeIdentifiers
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+@_silgen_name("GetCurrentProcess")
+private func tendonGetCurrentProcess(_ processSerialNumber: UnsafeMutablePointer<ProcessSerialNumber>) -> OSErr
+
+@_silgen_name("SetFrontProcessWithOptions")
+private func tendonSetFrontProcessWithOptions(
+    _ processSerialNumber: UnsafePointer<ProcessSerialNumber>,
+    _ options: OptionBits
+) -> OSStatus
+
 enum LauncherHotKey: String, CaseIterable {
     case optionN = "option-n"
     case optionSpace = "option-space"
@@ -5319,8 +5328,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "search_focused": didFocusSynchronously
         ])
 
-        scheduleLauncherFocusRetries(startedAt: startedAt)
-
         if !didRefreshSynchronously {
             scheduleApplicationRefreshAfterPresentation(
                 force: false,
@@ -5340,6 +5347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
+        let frontProcessStatus = setCurrentProcessFrontmost()
         let activated = NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -5350,6 +5358,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let didFocus = launcherViewController.focusSearchField()
         AppLog.write("launcher_focus_attempt", [
             "reason": reason,
+            "front_process_get_status": Int(frontProcessStatus.getStatus),
+            "front_process_set_status": Int(frontProcessStatus.setStatus),
             "running_application_activated": activated,
             "window_visible": window.isVisible,
             "window_key": window.isKeyWindow,
@@ -5364,27 +5374,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return didFocus && launcherViewController.isSearchFieldFocused()
     }
 
-    private func scheduleLauncherFocusRetries(startedAt: Date) {
-        for (index, delay) in [0.0, 0.02, 0.06, 0.12, 0.25].enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, self.window?.isVisible == true else {
-                    return
-                }
-
-                let retryStartedAt = Date()
-                let didFocus = self.presentAndFocusLauncherWindow(
-                    reason: "show_launcher_focus_retry_\(index)"
-                )
-
-                AppLog.write("show_launcher_focus_retry_timing", [
-                    "retry_index": index,
-                    "configured_delay_ms": Int(delay * 1000),
-                    "retry_duration_ms": Self.elapsedMilliseconds(since: retryStartedAt),
-                    "total_since_show_start_ms": Self.elapsedMilliseconds(since: startedAt),
-                    "search_focused": didFocus
-                ])
-            }
+    private func setCurrentProcessFrontmost() -> (getStatus: OSStatus, setStatus: OSStatus) {
+        var processSerialNumber = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: 0)
+        let getStatus = OSStatus(tendonGetCurrentProcess(&processSerialNumber))
+        guard getStatus == noErr else {
+            return (getStatus, getStatus)
         }
+
+        let setStatus = tendonSetFrontProcessWithOptions(
+            &processSerialNumber,
+            OptionBits(kSetFrontProcessCausedByUser)
+        )
+        return (getStatus, setStatus)
     }
 
     private func installLauncherDismissMonitors() {
