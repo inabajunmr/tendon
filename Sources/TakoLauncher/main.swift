@@ -4196,8 +4196,18 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         applyFilter()
     }
 
-    func focusSearchField() {
-        view.window?.makeFirstResponder(searchField)
+    @discardableResult
+    func focusSearchField() -> Bool {
+        view.window?.makeFirstResponder(searchField) ?? false
+    }
+
+    func isSearchFieldFocused() -> Bool {
+        guard let window = view.window else {
+            return false
+        }
+
+        return window.firstResponder === searchField ||
+            window.firstResponder === searchField.currentEditor()
     }
 
     private func setupView() {
@@ -5284,7 +5294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let positionDurationMilliseconds = Self.elapsedMilliseconds(since: positionStartedAt)
 
         let presentStartedAt = Date()
-        presentLauncherWindow()
+        let didFocusSynchronously = presentAndFocusLauncherWindow(reason: "show_launcher_sync")
         let presentDurationMilliseconds = Self.elapsedMilliseconds(since: presentStartedAt)
 
         let monitorStartedAt = Date()
@@ -5305,33 +5315,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "hidden_noop_candidates": preparationResult.hiddenCounts,
             "window_visible": window?.isVisible ?? false,
             "window_key": window?.isKeyWindow ?? false,
-            "app_active": NSApp.isActive
+            "app_active": NSApp.isActive,
+            "search_focused": didFocusSynchronously
         ])
 
-        // The first presentation after launch can become visible without becoming key.
-        // Re-present on the next pass after AppKit processes activation.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else {
-                return
-            }
-
-            let asyncStartedAt = Date()
-            self.presentLauncherWindow()
-            let asyncPresentDurationMilliseconds = Self.elapsedMilliseconds(since: asyncStartedAt)
-
-            let focusStartedAt = Date()
-            self.launcherViewController.focusSearchField()
-            let focusDurationMilliseconds = Self.elapsedMilliseconds(since: focusStartedAt)
-
-            AppLog.write("show_launcher_async_timing", [
-                "present_window_ms": asyncPresentDurationMilliseconds,
-                "focus_search_field_ms": focusDurationMilliseconds,
-                "total_since_show_start_ms": Self.elapsedMilliseconds(since: startedAt),
-                "window_visible": self.window?.isVisible ?? false,
-                "window_key": self.window?.isKeyWindow ?? false,
-                "app_active": NSApp.isActive
-            ])
-        }
+        scheduleLauncherFocusRetries(startedAt: startedAt)
 
         if !didRefreshSynchronously {
             scheduleApplicationRefreshAfterPresentation(
@@ -5346,15 +5334,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         removeLauncherDismissMonitors()
     }
 
-    private func presentLauncherWindow() {
+    @discardableResult
+    private func presentAndFocusLauncherWindow(reason: String) -> Bool {
         guard let window else {
-            return
+            return false
         }
 
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        let activated = NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        window.makeMain()
+
+        let didFocus = launcherViewController.focusSearchField()
+        AppLog.write("launcher_focus_attempt", [
+            "reason": reason,
+            "running_application_activated": activated,
+            "window_visible": window.isVisible,
+            "window_key": window.isKeyWindow,
+            "window_main": window.isMainWindow,
+            "app_active": NSApp.isActive,
+            "search_focused": launcherViewController.isSearchFieldFocused(),
+            "make_first_responder_result": didFocus,
+            "frontmost_bundle_id": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil",
+            "frontmost_name": NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil"
+        ])
+
+        return didFocus && launcherViewController.isSearchFieldFocused()
+    }
+
+    private func scheduleLauncherFocusRetries(startedAt: Date) {
+        for (index, delay) in [0.0, 0.02, 0.06, 0.12, 0.25].enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.window?.isVisible == true else {
+                    return
+                }
+
+                let retryStartedAt = Date()
+                let didFocus = self.presentAndFocusLauncherWindow(
+                    reason: "show_launcher_focus_retry_\(index)"
+                )
+
+                AppLog.write("show_launcher_focus_retry_timing", [
+                    "retry_index": index,
+                    "configured_delay_ms": Int(delay * 1000),
+                    "retry_duration_ms": Self.elapsedMilliseconds(since: retryStartedAt),
+                    "total_since_show_start_ms": Self.elapsedMilliseconds(since: startedAt),
+                    "search_focused": didFocus
+                ])
+            }
+        }
     }
 
     private func installLauncherDismissMonitors() {
