@@ -316,6 +316,120 @@ private enum AccessibilityWindowIdentity {
     }
 }
 
+private struct FocusedWindowSnapshot {
+    let identifier: UInt32?
+    let title: String?
+}
+
+private final class WindowActivityMonitor {
+    private let onActivation: (NSRunningApplication, FocusedWindowSnapshot) -> Void
+    private var workspaceObserver: NSObjectProtocol?
+    private var accessibilityObserver: AXObserver?
+    private var observedProcessIdentifier: pid_t?
+
+    init(onActivation: @escaping (NSRunningApplication, FocusedWindowSnapshot) -> Void) {
+        self.onActivation = onActivation
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        guard workspaceObserver == nil else {
+            return
+        }
+
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.captureFrontmostWindow()
+        }
+        captureFrontmostWindow()
+    }
+
+    func stop() {
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            self.workspaceObserver = nil
+        }
+        stopObservingApplication()
+    }
+
+    @discardableResult
+    func captureFrontmostWindow() -> (application: NSRunningApplication, window: FocusedWindowSnapshot?)? {
+        guard
+            let application = NSWorkspace.shared.frontmostApplication,
+            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else {
+            stopObservingApplication()
+            return nil
+        }
+
+        observeApplication(application.processIdentifier)
+        let window = WindowActivator.frontmostWindow(for: application.processIdentifier)
+        if let window, AXIsProcessTrusted() {
+            onActivation(application, window)
+        }
+        return (application, window)
+    }
+
+    private func observeApplication(_ processIdentifier: pid_t) {
+        if observedProcessIdentifier == processIdentifier, accessibilityObserver != nil {
+            return
+        }
+
+        stopObservingApplication()
+        guard AXIsProcessTrusted() else {
+            return
+        }
+
+        var observer: AXObserver?
+        let result = AXObserverCreate(processIdentifier, { _, _, _, context in
+            guard let context else {
+                return
+            }
+            let monitor = Unmanaged<WindowActivityMonitor>.fromOpaque(context).takeUnretainedValue()
+            monitor.captureFrontmostWindow()
+        }, &observer)
+        guard result == .success, let observer else {
+            return
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        _ = AXUIElementSetAttributeValue(
+            applicationElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let results = [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification].map {
+            AXObserverAddNotification(observer, applicationElement, $0 as CFString, context)
+        }
+        guard results.contains(.success) else {
+            return
+        }
+
+        accessibilityObserver = observer
+        observedProcessIdentifier = processIdentifier
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+    }
+
+    private func stopObservingApplication() {
+        if let accessibilityObserver {
+            CFRunLoopRemoveSource(
+                CFRunLoopGetMain(),
+                AXObserverGetRunLoopSource(accessibilityObserver),
+                .commonModes
+            )
+        }
+        accessibilityObserver = nil
+        observedProcessIdentifier = nil
+    }
+}
+
 enum AppDiscovery {
     static func loadInstalledApplications() -> [LaunchableApp] {
         let fileManager = FileManager.default
@@ -2279,9 +2393,34 @@ enum WindowActivator {
     }
 
     static func frontmostWindowTitle(for processIdentifier: pid_t) -> String? {
-        accessibilityFocusedWindowTitle(for: processIdentifier) ?? CoreGraphicsWindowReader.candidateWindows().first {
+        frontmostWindow(for: processIdentifier)?.title
+    }
+
+    fileprivate static func frontmostWindow(for processIdentifier: pid_t) -> FocusedWindowSnapshot? {
+        if AXIsProcessTrusted() {
+            let applicationElement = AXUIElementCreateApplication(processIdentifier)
+            if let window = focusedWindow(in: applicationElement) {
+                let identifier = AccessibilityWindowIdentity.identifier(of: window)
+                let windowTitle = title(of: window)
+                let fallbackTitle: String?
+                if windowTitle == nil {
+                    fallbackTitle = CoreGraphicsWindowReader.candidateWindows().first {
+                        $0.ownerProcessIdentifier == processIdentifier &&
+                            (identifier == nil || $0.identifier == identifier) && $0.hasTitle
+                    }?.title
+                } else {
+                    fallbackTitle = nil
+                }
+                return FocusedWindowSnapshot(
+                    identifier: identifier,
+                    title: windowTitle ?? fallbackTitle
+                )
+            }
+        }
+
+        return CoreGraphicsWindowReader.candidateWindows().first {
             $0.ownerProcessIdentifier == processIdentifier && $0.hasTitle
-        }?.title
+        }.map { FocusedWindowSnapshot(identifier: $0.identifier, title: $0.title) }
     }
 
     private static func activateApplication(
@@ -3526,15 +3665,6 @@ enum WindowActivator {
         return String(describing: type(of: value))
     }
 
-    private static func accessibilityFocusedWindowTitle(for processIdentifier: pid_t) -> String? {
-        guard AXIsProcessTrusted() else {
-            return nil
-        }
-
-        let applicationElement = AXUIElementCreateApplication(processIdentifier)
-        return focusedWindow(in: applicationElement).flatMap { title(of: $0) }
-    }
-
     private static func focusedWindow(in applicationElement: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(
@@ -4458,6 +4588,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let launcherViewController = LauncherViewController()
     private let launchHistoryStore = LaunchHistoryStore()
+    private lazy var windowActivityMonitor = WindowActivityMonitor { [weak self] application, window in
+        guard let self else {
+            return
+        }
+
+        let windowHistoryKey = window.title.map {
+            WindowHistoryKey.make(
+                appHistoryKey: self.historyKey(for: application),
+                title: $0,
+                applicationName: application.localizedName
+            )
+        }
+        self.launchHistoryStore.recordWindowActivation(
+            processIdentifier: application.processIdentifier,
+            windowIdentifier: window.identifier,
+            historyKey: windowHistoryKey
+        )
+    }
     private var window: LauncherPanel?
     private var preferencesWindowController: PreferencesWindowController?
     private var statusItem: NSStatusItem?
@@ -4480,6 +4628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingApplicationRefreshWorkItem: DispatchWorkItem?
     private var previousFrontmostProcessIdentifier: pid_t?
     private var previousFrontmostWindowTitle: String?
+    private var previousFrontmostWindowIdentifier: UInt32?
     private var isRelaunchingFromReopen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -4492,6 +4641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleHotKeyInfrastructureRetries()
         LoginItemManager.enableByDefaultIfNeeded()
         refreshApplications(force: true)
+        windowActivityMonitor.start()
         WindowPermissionManager.requestStartupPermissions()
         AppLog.write("application_did_finish_launching", [
             "cached_installed_apps": cachedInstalledApps.count,
@@ -4629,6 +4779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        windowActivityMonitor.stop()
         pendingApplicationRefreshWorkItem?.cancel()
         pendingApplicationRefreshWorkItem = nil
 
@@ -5438,41 +5589,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func capturePreviousFrontmostWindow() {
-        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
+        guard let context = windowActivityMonitor.captureFrontmostWindow() else {
             previousFrontmostProcessIdentifier = nil
             previousFrontmostWindowTitle = nil
+            previousFrontmostWindowIdentifier = nil
             AppLog.write("capture_previous_frontmost_window", [
                 "result": "no_frontmost_application"
             ])
             return
         }
 
+        let frontmostApplication = context.application
         let processIdentifier = frontmostApplication.processIdentifier
         previousFrontmostProcessIdentifier = processIdentifier
-        previousFrontmostWindowTitle = WindowActivator.frontmostWindowTitle(for: processIdentifier)
-
-        if let previousFrontmostWindowTitle {
-            let appHistoryKey = historyKey(for: frontmostApplication)
-            let windowHistoryKey = WindowHistoryKey.make(
-                appHistoryKey: appHistoryKey,
-                title: previousFrontmostWindowTitle,
-                applicationName: frontmostApplication.localizedName
-            )
-            launchHistoryStore.recordUse(historyKey: windowHistoryKey)
-            AppLog.write("record_frontmost_window_use", [
-                "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
-                "localized_name": frontmostApplication.localizedName ?? "nil",
-                "pid": Int(processIdentifier),
-                "window_title": previousFrontmostWindowTitle,
-                "history_key": windowHistoryKey
-            ])
-        }
+        previousFrontmostWindowTitle = context.window?.title
+        previousFrontmostWindowIdentifier = context.window?.identifier
 
         AppLog.write("capture_previous_frontmost_window", [
             "pid": Int(processIdentifier),
             "localized_name": frontmostApplication.localizedName ?? "nil",
             "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
-            "window_title": previousFrontmostWindowTitle ?? "nil"
+            "window_title": previousFrontmostWindowTitle ?? "nil",
+            "window_identifier": logWindowIdentifier(previousFrontmostWindowIdentifier)
         ])
     }
 
@@ -5753,7 +5891,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func isCurrentWindow(_ app: LaunchableApp) -> Bool {
         guard
             app.targetKind == .window,
-            app.processIdentifier == previousFrontmostProcessIdentifier,
+            app.processIdentifier == previousFrontmostProcessIdentifier
+        else {
+            return false
+        }
+
+        if let identifier = app.windowIdentifier, let previousIdentifier = previousFrontmostWindowIdentifier {
+            return identifier == previousIdentifier
+        }
+
+        guard
             let windowTitle = trimmed(app.windowTitle),
             let previousTitle = trimmed(previousFrontmostWindowTitle)
         else {

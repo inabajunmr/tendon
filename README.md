@@ -117,8 +117,10 @@ If window titles do not appear, check System Settings -> Privacy & Security and 
 allowed item is the same app bundle you are launching. Rebuilding a locally signed app can make
 macOS treat it as a new app for privacy permissions.
 
-Matching results are ranked by local launch history: most recent launch first, then launch count,
-then application name. History is stored at:
+Windows appear first, ordered by their most recent activation, including switches outside Tendon
+when Accessibility permission is granted. The current window is excluded. Windows not observed yet
+fall back to the macOS window stacking order. Other matching results are ranked by local launch
+history: most recent launch first, then launch count, then application name. History is stored at:
 
 ```text
 ~/Library/Application Support/Tendon/launch-history.json
