@@ -1643,7 +1643,7 @@ private enum AudioDeviceDiscovery {
                 "default_system_output_status": Int(systemOutputStatus)
             ])
             return outputStatus == noErr
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return false
         }
     }
@@ -1673,7 +1673,7 @@ private enum AudioDeviceDiscovery {
         case .audioOutput:
             searchAliases = ["sound output", "audio output", "speaker", "headphones", "output"]
             historyPrefix = "audio-output"
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             searchAliases = []
             historyPrefix = "audio"
         }
@@ -1901,51 +1901,9 @@ private enum AudioDeviceDiscovery {
             return 0
         case .audioOutput:
             return 1
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return 2
         }
-    }
-}
-
-private enum WebSearchCandidateFactory {
-    static func candidate(for query: String) -> LaunchableApp? {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else {
-            return nil
-        }
-
-        var components = URLComponents(string: "https://www.google.com/search")
-        components?.queryItems = [
-            URLQueryItem(name: "q", value: trimmedQuery)
-        ]
-
-        guard let url = components?.url else {
-            return nil
-        }
-
-        let identityKey = "web-search:google:\(trimmedQuery)"
-        let searchText = [
-            trimmedQuery,
-            "google",
-            "search",
-            "web"
-        ].joined(separator: " ")
-
-        return LaunchableApp(
-            name: "Google 検索: \(trimmedQuery)",
-            applicationName: "Google",
-            url: url,
-            bundleIdentifier: nil,
-            searchText: searchText,
-            identityKey: identityKey,
-            historyKey: identityKey,
-            processIdentifier: nil,
-            isRunning: false,
-            targetKind: .webSearch,
-            windowTitle: nil,
-            windowFrame: nil,
-            windowIdentifier: nil
-        )
     }
 }
 
@@ -2021,7 +1979,7 @@ private enum BluetoothDeviceDiscovery {
             status = wasConnected ? kIOReturnSuccess : device.openConnection()
         case .bluetoothDisconnect:
             status = wasConnected ? device.closeConnection() : kIOReturnSuccess
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             return nil
         }
 
@@ -2038,7 +1996,7 @@ private enum BluetoothDeviceDiscovery {
             success = status == kIOReturnSuccess || isConnected
         case .bluetoothDisconnect:
             success = status == kIOReturnSuccess || !isConnected
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             success = false
         }
 
@@ -2138,7 +2096,7 @@ private enum BluetoothDeviceDiscovery {
             return 0
         case .bluetoothConnect:
             return 1
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             return 2
         }
     }
@@ -2385,7 +2343,7 @@ enum WindowActivator {
             return false
         case .audioInput, .audioOutput:
             return false
-        case .webSearch:
+        case .webSearch, .webURL:
             return false
         case .bluetoothConnect, .bluetoothDisconnect:
             return false
@@ -3872,6 +3830,8 @@ final class AppCellView: NSTableCellView {
             appIconView.image = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil)
         } else if app.targetKind == .webSearch {
             appIconView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        } else if app.targetKind == .webURL {
+            appIconView.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
         } else if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
             appIconView.image = audioIcon
         } else if app.targetKind == .bookmark {
@@ -3906,7 +3866,7 @@ final class AppCellView: NSTableCellView {
             return NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
         case .audioOutput:
             return NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: nil)
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return nil
         }
     }
@@ -4521,9 +4481,13 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         filteredApps = sortApps?(matchingApps) ?? matchingApps
 
         if
-            let webSearchCandidate = WebSearchCandidateFactory.candidate(for: query),
-            !(isHidden?(webSearchCandidate) ?? false) {
-            filteredApps.append(webSearchCandidate)
+            let webCandidate = WebQueryCandidateFactory.candidate(for: query),
+            !(isHidden?(webCandidate) ?? false) {
+            if webCandidate.targetKind == .webURL {
+                filteredApps.insert(webCandidate, at: 0)
+            } else {
+                filteredApps.append(webCandidate)
+            }
         }
 
         tableView.reloadData()
@@ -5940,8 +5904,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if app.targetKind == .webSearch {
-            launchWebSearch(app)
+        if app.targetKind == .webSearch || app.targetKind == .webURL {
+            launchWebCandidate(app)
             return
         }
 
@@ -6040,13 +6004,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func launchWebSearch(_ app: LaunchableApp) {
+    private func launchWebCandidate(_ app: LaunchableApp) {
         guard let url = app.url else {
             NSSound.beep()
             AppLog.write("launch_failed", [
                 "name": app.name,
                 "target_kind": app.targetKind.logValue,
-                "reason": "missing_web_search_url"
+                "reason": app.targetKind == .webURL ? "missing_web_url" : "missing_web_search_url"
             ])
             return
         }
@@ -6062,7 +6026,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLog.write("launch_failed", [
                 "name": app.name,
                 "target_kind": app.targetKind.logValue,
-                "reason": "failed_to_open_web_search_url"
+                "reason": app.targetKind == .webURL ? "failed_to_open_web_url" : "failed_to_open_web_search_url"
             ])
         }
     }

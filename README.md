@@ -94,7 +94,7 @@ Open, or use the "Open Anyway" button in System Settings -> Privacy & Security.
 - `Command+A`: select all text in the search field
 - `Up` / `Down`: move selection
 - `Control+N` / `Control+P`: move selection while typing
-- `Enter`: launch the selected app
+- `Enter`: open the selected candidate
 - `Esc`: hide Tendon
 - Click an item to open it
 
@@ -108,7 +108,9 @@ Sound input and output devices are included as candidates when you type terms su
 or `sound output`. Selecting one switches the macOS default input or output device.
 Paired or recently used Bluetooth devices are included as candidates when you type terms such as
 `ble` or `bluetooth`. Selecting one connects or disconnects that device.
-When the search field is not empty, the last candidate searches Google for the entered text.
+Enter a web URL and press `Enter` to open it with the default browser. The URL candidate appears
+first; addresses without a scheme, such as `example.com`, use `https://`.
+For other nonempty input, the last candidate searches Google for the entered text.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.
 macOS may require Accessibility permission for window focusing and Screen Recording permission for

@@ -174,6 +174,7 @@ final class LaunchHistoryStore {
              .audioInput,
              .audioOutput,
              .webSearch,
+             .webURL,
              .bluetoothConnect,
              .bluetoothDisconnect:
             return 1
