@@ -17,6 +17,10 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]
+        ),
+        .testTarget(
+            name: "TendonTests",
+            dependencies: ["Tendon"]
         )
     ]
 )

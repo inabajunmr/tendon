@@ -12,6 +12,7 @@ struct HiddenCandidate: Codable, Hashable {
 enum AppPreferences {
     private static let includeChromeBookmarksKey = "includeChromeBookmarks"
     private static let didApplyLaunchAtLoginDefaultKey = "didApplyLaunchAtLoginDefault"
+    private static let launcherHotKeyKey = "launcherHotKey"
     private static let hiddenCandidateKeysKey = "hiddenCandidateKeys"
     private static let hiddenCandidatesKey = "hiddenCandidates"
 
@@ -34,6 +35,22 @@ enum AppPreferences {
         }
         set {
             UserDefaults.standard.set(newValue, forKey: didApplyLaunchAtLoginDefaultKey)
+        }
+    }
+
+    static var launcherHotKey: LauncherHotKey {
+        get {
+            guard
+                let rawValue = UserDefaults.standard.string(forKey: launcherHotKeyKey),
+                let hotKey = LauncherHotKey(rawValue: rawValue)
+            else {
+                return .defaultValue
+            }
+
+            return hotKey
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: launcherHotKeyKey)
         }
     }
 
@@ -103,6 +120,7 @@ enum LaunchTargetKind: Hashable {
     case audioInput
     case audioOutput
     case webSearch
+    case webURL
     case bluetoothConnect
     case bluetoothDisconnect
 
@@ -120,6 +138,8 @@ enum LaunchTargetKind: Hashable {
             return "audio_output"
         case .webSearch:
             return "web_search"
+        case .webURL:
+            return "web_url"
         case .bluetoothConnect:
             return "bluetooth_connect"
         case .bluetoothDisconnect:
@@ -215,6 +235,8 @@ struct LaunchableApp: Hashable {
             return "Sound Output\(suffix)"
         case .webSearch:
             return url?.absoluteString ?? "Google Search"
+        case .webURL:
+            return url?.absoluteString ?? "Web URL"
         case .bluetoothConnect:
             return "Bluetooth - Not Connected"
         case .bluetoothDisconnect:
@@ -243,7 +265,7 @@ struct LaunchableApp: Hashable {
             switch targetKind {
             case .application, .window:
                 return true
-            case .bookmark, .audioInput, .audioOutput, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+            case .bookmark, .audioInput, .audioOutput, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
                 return false
             }
         }

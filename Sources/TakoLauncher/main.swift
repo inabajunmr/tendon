@@ -11,6 +11,51 @@ import UniformTypeIdentifiers
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+@_silgen_name("GetCurrentProcess")
+private func tendonGetCurrentProcess(_ processSerialNumber: UnsafeMutablePointer<ProcessSerialNumber>) -> OSErr
+
+@_silgen_name("SetFrontProcessWithOptions")
+private func tendonSetFrontProcessWithOptions(
+    _ processSerialNumber: UnsafePointer<ProcessSerialNumber>,
+    _ options: OptionBits
+) -> OSStatus
+
+enum LauncherHotKey: String, CaseIterable {
+    case optionN = "option-n"
+    case optionSpace = "option-space"
+
+    static let defaultValue: LauncherHotKey = .optionN
+
+    var displayName: String {
+        switch self {
+        case .optionN:
+            return "Option+N"
+        case .optionSpace:
+            return "Option+Space"
+        }
+    }
+
+    var keyCode: UInt32 {
+        switch self {
+        case .optionN:
+            return UInt32(kVK_ANSI_N)
+        case .optionSpace:
+            return UInt32(kVK_Space)
+        }
+    }
+
+    var carbonModifiers: UInt32 {
+        UInt32(optionKey)
+    }
+
+    func matches(keyCode: UInt16, hasOption: Bool, hasCommand: Bool, hasControl: Bool) -> Bool {
+        UInt32(keyCode) == self.keyCode &&
+            hasOption &&
+            !hasCommand &&
+            !hasControl
+    }
+}
+
 private struct CoreGraphicsWindowInfo {
     let identifier: UInt32?
     let ownerProcessIdentifier: pid_t
@@ -268,6 +313,120 @@ private enum AccessibilityWindowIdentity {
             error: error,
             symbolName: resolvedFunction.name
         )
+    }
+}
+
+private struct FocusedWindowSnapshot {
+    let identifier: UInt32?
+    let title: String?
+}
+
+private final class WindowActivityMonitor {
+    private let onActivation: (NSRunningApplication, FocusedWindowSnapshot) -> Void
+    private var workspaceObserver: NSObjectProtocol?
+    private var accessibilityObserver: AXObserver?
+    private var observedProcessIdentifier: pid_t?
+
+    init(onActivation: @escaping (NSRunningApplication, FocusedWindowSnapshot) -> Void) {
+        self.onActivation = onActivation
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        guard workspaceObserver == nil else {
+            return
+        }
+
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.captureFrontmostWindow()
+        }
+        captureFrontmostWindow()
+    }
+
+    func stop() {
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            self.workspaceObserver = nil
+        }
+        stopObservingApplication()
+    }
+
+    @discardableResult
+    func captureFrontmostWindow() -> (application: NSRunningApplication, window: FocusedWindowSnapshot?)? {
+        guard
+            let application = NSWorkspace.shared.frontmostApplication,
+            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else {
+            stopObservingApplication()
+            return nil
+        }
+
+        observeApplication(application.processIdentifier)
+        let window = WindowActivator.frontmostWindow(for: application.processIdentifier)
+        if let window, AXIsProcessTrusted() {
+            onActivation(application, window)
+        }
+        return (application, window)
+    }
+
+    private func observeApplication(_ processIdentifier: pid_t) {
+        if observedProcessIdentifier == processIdentifier, accessibilityObserver != nil {
+            return
+        }
+
+        stopObservingApplication()
+        guard AXIsProcessTrusted() else {
+            return
+        }
+
+        var observer: AXObserver?
+        let result = AXObserverCreate(processIdentifier, { _, _, _, context in
+            guard let context else {
+                return
+            }
+            let monitor = Unmanaged<WindowActivityMonitor>.fromOpaque(context).takeUnretainedValue()
+            monitor.captureFrontmostWindow()
+        }, &observer)
+        guard result == .success, let observer else {
+            return
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        _ = AXUIElementSetAttributeValue(
+            applicationElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let results = [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification].map {
+            AXObserverAddNotification(observer, applicationElement, $0 as CFString, context)
+        }
+        guard results.contains(.success) else {
+            return
+        }
+
+        accessibilityObserver = observer
+        observedProcessIdentifier = processIdentifier
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+    }
+
+    private func stopObservingApplication() {
+        if let accessibilityObserver {
+            CFRunLoopRemoveSource(
+                CFRunLoopGetMain(),
+                AXObserverGetRunLoopSource(accessibilityObserver),
+                .commonModes
+            )
+        }
+        accessibilityObserver = nil
+        observedProcessIdentifier = nil
     }
 }
 
@@ -1484,7 +1643,7 @@ private enum AudioDeviceDiscovery {
                 "default_system_output_status": Int(systemOutputStatus)
             ])
             return outputStatus == noErr
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return false
         }
     }
@@ -1514,7 +1673,7 @@ private enum AudioDeviceDiscovery {
         case .audioOutput:
             searchAliases = ["sound output", "audio output", "speaker", "headphones", "output"]
             historyPrefix = "audio-output"
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             searchAliases = []
             historyPrefix = "audio"
         }
@@ -1742,51 +1901,9 @@ private enum AudioDeviceDiscovery {
             return 0
         case .audioOutput:
             return 1
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return 2
         }
-    }
-}
-
-private enum WebSearchCandidateFactory {
-    static func candidate(for query: String) -> LaunchableApp? {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else {
-            return nil
-        }
-
-        var components = URLComponents(string: "https://www.google.com/search")
-        components?.queryItems = [
-            URLQueryItem(name: "q", value: trimmedQuery)
-        ]
-
-        guard let url = components?.url else {
-            return nil
-        }
-
-        let identityKey = "web-search:google:\(trimmedQuery)"
-        let searchText = [
-            trimmedQuery,
-            "google",
-            "search",
-            "web"
-        ].joined(separator: " ")
-
-        return LaunchableApp(
-            name: "Google 検索: \(trimmedQuery)",
-            applicationName: "Google",
-            url: url,
-            bundleIdentifier: nil,
-            searchText: searchText,
-            identityKey: identityKey,
-            historyKey: identityKey,
-            processIdentifier: nil,
-            isRunning: false,
-            targetKind: .webSearch,
-            windowTitle: nil,
-            windowFrame: nil,
-            windowIdentifier: nil
-        )
     }
 }
 
@@ -1862,7 +1979,7 @@ private enum BluetoothDeviceDiscovery {
             status = wasConnected ? kIOReturnSuccess : device.openConnection()
         case .bluetoothDisconnect:
             status = wasConnected ? device.closeConnection() : kIOReturnSuccess
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             return nil
         }
 
@@ -1879,7 +1996,7 @@ private enum BluetoothDeviceDiscovery {
             success = status == kIOReturnSuccess || isConnected
         case .bluetoothDisconnect:
             success = status == kIOReturnSuccess || !isConnected
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             success = false
         }
 
@@ -1979,7 +2096,7 @@ private enum BluetoothDeviceDiscovery {
             return 0
         case .bluetoothConnect:
             return 1
-        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch, .webURL:
             return 2
         }
     }
@@ -2226,7 +2343,7 @@ enum WindowActivator {
             return false
         case .audioInput, .audioOutput:
             return false
-        case .webSearch:
+        case .webSearch, .webURL:
             return false
         case .bluetoothConnect, .bluetoothDisconnect:
             return false
@@ -2234,9 +2351,34 @@ enum WindowActivator {
     }
 
     static func frontmostWindowTitle(for processIdentifier: pid_t) -> String? {
-        accessibilityFocusedWindowTitle(for: processIdentifier) ?? CoreGraphicsWindowReader.candidateWindows().first {
+        frontmostWindow(for: processIdentifier)?.title
+    }
+
+    fileprivate static func frontmostWindow(for processIdentifier: pid_t) -> FocusedWindowSnapshot? {
+        if AXIsProcessTrusted() {
+            let applicationElement = AXUIElementCreateApplication(processIdentifier)
+            if let window = focusedWindow(in: applicationElement) {
+                let identifier = AccessibilityWindowIdentity.identifier(of: window)
+                let windowTitle = title(of: window)
+                let fallbackTitle: String?
+                if windowTitle == nil {
+                    fallbackTitle = CoreGraphicsWindowReader.candidateWindows().first {
+                        $0.ownerProcessIdentifier == processIdentifier &&
+                            (identifier == nil || $0.identifier == identifier) && $0.hasTitle
+                    }?.title
+                } else {
+                    fallbackTitle = nil
+                }
+                return FocusedWindowSnapshot(
+                    identifier: identifier,
+                    title: windowTitle ?? fallbackTitle
+                )
+            }
+        }
+
+        return CoreGraphicsWindowReader.candidateWindows().first {
             $0.ownerProcessIdentifier == processIdentifier && $0.hasTitle
-        }?.title
+        }.map { FocusedWindowSnapshot(identifier: $0.identifier, title: $0.title) }
     }
 
     private static func activateApplication(
@@ -3481,15 +3623,6 @@ enum WindowActivator {
         return String(describing: type(of: value))
     }
 
-    private static func accessibilityFocusedWindowTitle(for processIdentifier: pid_t) -> String? {
-        guard AXIsProcessTrusted() else {
-            return nil
-        }
-
-        let applicationElement = AXUIElementCreateApplication(processIdentifier)
-        return focusedWindow(in: applicationElement).flatMap { title(of: $0) }
-    }
-
     private static func focusedWindow(in applicationElement: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(
@@ -3697,6 +3830,8 @@ final class AppCellView: NSTableCellView {
             appIconView.image = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil)
         } else if app.targetKind == .webSearch {
             appIconView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        } else if app.targetKind == .webURL {
+            appIconView.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
         } else if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
             appIconView.image = audioIcon
         } else if app.targetKind == .bookmark {
@@ -3731,7 +3866,7 @@ final class AppCellView: NSTableCellView {
             return NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
         case .audioOutput:
             return NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: nil)
-        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
+        case .application, .window, .bookmark, .webSearch, .webURL, .bluetoothConnect, .bluetoothDisconnect:
             return nil
         }
     }
@@ -3793,6 +3928,7 @@ final class AppCellView: NSTableCellView {
 final class PreferencesViewController: NSViewController {
     var onIncludeChromeBookmarksChanged: ((Bool) -> Void)?
     var onLaunchAtLoginChanged: ((Bool) -> Void)?
+    var onLauncherHotKeyChanged: ((LauncherHotKey) -> Void)?
     var onRestoreHiddenCandidate: ((HiddenCandidate) -> Void)?
 
     private let includeChromeBookmarksButton = NSButton(
@@ -3800,6 +3936,8 @@ final class PreferencesViewController: NSViewController {
         target: nil,
         action: nil
     )
+    private let launcherHotKeyLabel = NSTextField(labelWithString: "Show/hide Tendon")
+    private let launcherHotKeyMenu = NSPopUpButton(frame: .zero, pullsDown: false)
     private let launchAtLoginButton = NSButton(
         checkboxWithTitle: "Launch at login",
         target: nil,
@@ -3814,10 +3952,17 @@ final class PreferencesViewController: NSViewController {
     )
     private var hiddenCandidates: [HiddenCandidate] = []
 
-    init(includeChromeBookmarks: Bool, launchAtLogin: Bool, hiddenCandidates: [HiddenCandidate]) {
+    init(
+        includeChromeBookmarks: Bool,
+        launchAtLogin: Bool,
+        launcherHotKey: LauncherHotKey,
+        hiddenCandidates: [HiddenCandidate]
+    ) {
         super.init(nibName: nil, bundle: nil)
         includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
         launchAtLoginButton.state = launchAtLogin ? .on : .off
+        configureLauncherHotKeyMenu()
+        setLauncherHotKey(launcherHotKey)
         setHiddenCandidates(hiddenCandidates)
     }
 
@@ -3826,7 +3971,7 @@ final class PreferencesViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 284))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 344))
     }
 
     override func viewDidLoad() {
@@ -3840,6 +3985,10 @@ final class PreferencesViewController: NSViewController {
 
     func setLaunchAtLogin(_ launchAtLogin: Bool) {
         launchAtLoginButton.state = launchAtLogin ? .on : .off
+    }
+
+    func setLauncherHotKey(_ launcherHotKey: LauncherHotKey) {
+        launcherHotKeyMenu.selectItem(withTitle: launcherHotKey.displayName)
     }
 
     func setHiddenCandidates(_ hiddenCandidates: [HiddenCandidate]) {
@@ -3864,12 +4013,20 @@ final class PreferencesViewController: NSViewController {
 
     private func setup() {
         let sourcesLabel = sectionLabel("Sources")
+        let shortcutLabel = sectionLabel("Shortcut")
         let startupLabel = sectionLabel("Startup")
         let hiddenItemsLabel = sectionLabel("Hidden Items")
 
         includeChromeBookmarksButton.translatesAutoresizingMaskIntoConstraints = false
         includeChromeBookmarksButton.target = self
         includeChromeBookmarksButton.action = #selector(toggleIncludeChromeBookmarks(_:))
+
+        launcherHotKeyLabel.translatesAutoresizingMaskIntoConstraints = false
+        launcherHotKeyLabel.textColor = .secondaryLabelColor
+
+        launcherHotKeyMenu.translatesAutoresizingMaskIntoConstraints = false
+        launcherHotKeyMenu.target = self
+        launcherHotKeyMenu.action = #selector(changeLauncherHotKey(_:))
 
         launchAtLoginButton.translatesAutoresizingMaskIntoConstraints = false
         launchAtLoginButton.target = self
@@ -3886,6 +4043,9 @@ final class PreferencesViewController: NSViewController {
 
         view.addSubview(sourcesLabel)
         view.addSubview(includeChromeBookmarksButton)
+        view.addSubview(shortcutLabel)
+        view.addSubview(launcherHotKeyLabel)
+        view.addSubview(launcherHotKeyMenu)
         view.addSubview(startupLabel)
         view.addSubview(launchAtLoginButton)
         view.addSubview(hiddenItemsLabel)
@@ -3902,9 +4062,21 @@ final class PreferencesViewController: NSViewController {
             includeChromeBookmarksButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
             includeChromeBookmarksButton.topAnchor.constraint(equalTo: sourcesLabel.bottomAnchor, constant: 14),
 
+            shortcutLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            shortcutLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
+            shortcutLabel.topAnchor.constraint(equalTo: includeChromeBookmarksButton.bottomAnchor, constant: 24),
+
+            launcherHotKeyLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
+            launcherHotKeyLabel.centerYAnchor.constraint(equalTo: launcherHotKeyMenu.centerYAnchor),
+
+            launcherHotKeyMenu.leadingAnchor.constraint(equalTo: launcherHotKeyLabel.trailingAnchor, constant: 14),
+            launcherHotKeyMenu.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
+            launcherHotKeyMenu.topAnchor.constraint(equalTo: shortcutLabel.bottomAnchor, constant: 10),
+            launcherHotKeyMenu.widthAnchor.constraint(equalToConstant: 164),
+
             startupLabel.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
             startupLabel.trailingAnchor.constraint(equalTo: sourcesLabel.trailingAnchor),
-            startupLabel.topAnchor.constraint(equalTo: includeChromeBookmarksButton.bottomAnchor, constant: 24),
+            startupLabel.topAnchor.constraint(equalTo: launcherHotKeyMenu.bottomAnchor, constant: 24),
 
             launchAtLoginButton.leadingAnchor.constraint(equalTo: sourcesLabel.leadingAnchor),
             launchAtLoginButton.trailingAnchor.constraint(lessThanOrEqualTo: sourcesLabel.trailingAnchor),
@@ -3935,12 +4107,32 @@ final class PreferencesViewController: NSViewController {
         return label
     }
 
+    private func configureLauncherHotKeyMenu() {
+        launcherHotKeyMenu.removeAllItems()
+
+        for hotKey in LauncherHotKey.allCases {
+            launcherHotKeyMenu.addItem(withTitle: hotKey.displayName)
+            launcherHotKeyMenu.lastItem?.representedObject = hotKey.rawValue
+        }
+    }
+
     @objc private func toggleIncludeChromeBookmarks(_ sender: NSButton) {
         onIncludeChromeBookmarksChanged?(sender.state == .on)
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSButton) {
         onLaunchAtLoginChanged?(sender.state == .on)
+    }
+
+    @objc private func changeLauncherHotKey(_ sender: NSPopUpButton) {
+        guard
+            let rawValue = sender.selectedItem?.representedObject as? String,
+            let launcherHotKey = LauncherHotKey(rawValue: rawValue)
+        else {
+            return
+        }
+
+        onLauncherHotKeyChanged?(launcherHotKey)
     }
 
     private func hiddenCandidateTitle(_ candidate: HiddenCandidate) -> String {
@@ -3970,19 +4162,22 @@ final class PreferencesWindowController: NSWindowController {
     init(
         includeChromeBookmarks: Bool,
         launchAtLogin: Bool,
+        launcherHotKey: LauncherHotKey,
         hiddenCandidates: [HiddenCandidate],
         onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void,
         onLaunchAtLoginChanged: @escaping (Bool) -> Void,
+        onLauncherHotKeyChanged: @escaping (LauncherHotKey) -> Void,
         onRestoreHiddenCandidate: @escaping (HiddenCandidate) -> Void
     ) {
         self.preferencesViewController = PreferencesViewController(
             includeChromeBookmarks: includeChromeBookmarks,
             launchAtLogin: launchAtLogin,
+            launcherHotKey: launcherHotKey,
             hiddenCandidates: hiddenCandidates
         )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 284),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 344),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -3995,6 +4190,7 @@ final class PreferencesWindowController: NSWindowController {
         super.init(window: window)
         preferencesViewController.onIncludeChromeBookmarksChanged = onIncludeChromeBookmarksChanged
         preferencesViewController.onLaunchAtLoginChanged = onLaunchAtLoginChanged
+        preferencesViewController.onLauncherHotKeyChanged = onLauncherHotKeyChanged
         preferencesViewController.onRestoreHiddenCandidate = onRestoreHiddenCandidate
     }
 
@@ -4005,6 +4201,7 @@ final class PreferencesWindowController: NSWindowController {
     func syncFromPreferences() {
         preferencesViewController.setIncludeChromeBookmarks(AppPreferences.includeChromeBookmarks)
         preferencesViewController.setLaunchAtLogin(LoginItemManager.isEnabled)
+        preferencesViewController.setLauncherHotKey(AppPreferences.launcherHotKey)
         preferencesViewController.setHiddenCandidates(AppPreferences.hiddenCandidates)
     }
 }
@@ -4098,8 +4295,18 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         applyFilter()
     }
 
-    func focusSearchField() {
-        view.window?.makeFirstResponder(searchField)
+    @discardableResult
+    func focusSearchField() -> Bool {
+        view.window?.makeFirstResponder(searchField) ?? false
+    }
+
+    func isSearchFieldFocused() -> Bool {
+        guard let window = view.window else {
+            return false
+        }
+
+        return window.firstResponder === searchField ||
+            window.firstResponder === searchField.currentEditor()
     }
 
     private func setupView() {
@@ -4274,9 +4481,13 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         filteredApps = sortApps?(matchingApps) ?? matchingApps
 
         if
-            let webSearchCandidate = WebSearchCandidateFactory.candidate(for: query),
-            !(isHidden?(webSearchCandidate) ?? false) {
-            filteredApps.append(webSearchCandidate)
+            let webCandidate = WebQueryCandidateFactory.candidate(for: query),
+            !(isHidden?(webCandidate) ?? false) {
+            if webCandidate.targetKind == .webURL {
+                filteredApps.insert(webCandidate, at: 0)
+            } else {
+                filteredApps.append(webCandidate)
+            }
         }
 
         tableView.reloadData()
@@ -4341,6 +4552,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let launcherViewController = LauncherViewController()
     private let launchHistoryStore = LaunchHistoryStore()
+    private lazy var windowActivityMonitor = WindowActivityMonitor { [weak self] application, window in
+        guard let self else {
+            return
+        }
+
+        let windowHistoryKey = window.title.map {
+            WindowHistoryKey.make(
+                appHistoryKey: self.historyKey(for: application),
+                title: $0,
+                applicationName: application.localizedName
+            )
+        }
+        self.launchHistoryStore.recordWindowActivation(
+            processIdentifier: application.processIdentifier,
+            windowIdentifier: window.identifier,
+            historyKey: windowHistoryKey
+        )
+    }
     private var window: LauncherPanel?
     private var preferencesWindowController: PreferencesWindowController?
     private var statusItem: NSStatusItem?
@@ -4363,6 +4592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingApplicationRefreshWorkItem: DispatchWorkItem?
     private var previousFrontmostProcessIdentifier: pid_t?
     private var previousFrontmostWindowTitle: String?
+    private var previousFrontmostWindowIdentifier: UInt32?
     private var isRelaunchingFromReopen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -4375,6 +4605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleHotKeyInfrastructureRetries()
         LoginItemManager.enableByDefaultIfNeeded()
         refreshApplications(force: true)
+        windowActivityMonitor.start()
         WindowPermissionManager.requestStartupPermissions()
         AppLog.write("application_did_finish_launching", [
             "cached_installed_apps": cachedInstalledApps.count,
@@ -4512,6 +4743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        windowActivityMonitor.stop()
         pendingApplicationRefreshWorkItem?.cancel()
         pendingApplicationRefreshWorkItem = nil
 
@@ -4639,6 +4871,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func registerHotKey() {
         ensureHotKeyInfrastructure(reason: "startup")
+    }
+
+    private func unregisterCarbonHotKey(reason: String) {
+        guard let hotKeyRef else {
+            return
+        }
+
+        let status = UnregisterEventHotKey(hotKeyRef)
+        self.hotKeyRef = nil
+        AppLog.write("hotkey_unregister", [
+            "reason": reason,
+            "status": Int(status)
+        ])
+    }
+
+    private func applyLauncherHotKeyPreference(_ launcherHotKey: LauncherHotKey) {
+        guard AppPreferences.launcherHotKey != launcherHotKey else {
+            return
+        }
+
+        AppPreferences.launcherHotKey = launcherHotKey
+        unregisterCarbonHotKey(reason: "preferences_changed")
+        ensureHotKeyInfrastructure(reason: "preferences_changed")
     }
 
     private func carbonHotKeyTarget() -> EventTargetRef {
@@ -4772,11 +5027,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        let launcherHotKey = AppPreferences.launcherHotKey
         let hotKeyID = EventHotKeyID(signature: fourCharacterCode("TNDN"), id: 1)
         var registeredHotKeyRef: EventHotKeyRef?
         let registerStatus = RegisterEventHotKey(
-            UInt32(kVK_ANSI_N),
-            UInt32(optionKey),
+            launcherHotKey.keyCode,
+            launcherHotKey.carbonModifiers,
             hotKeyID,
             carbonHotKeyTarget(),
             0,
@@ -4786,14 +5042,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLog.write("hotkey_register", [
             "reason": reason,
             "status": Int(registerStatus),
-            "key_code": Int(kVK_ANSI_N),
-            "modifiers": Int(optionKey),
+            "hotkey": launcherHotKey.displayName,
+            "key_code": Int(launcherHotKey.keyCode),
+            "modifiers": Int(launcherHotKey.carbonModifiers),
             "target": "event_dispatcher"
         ])
 
         if registerStatus != noErr {
             hotKeyRef = nil
-            reportHotKeyFailure(status: registerStatus)
+            reportHotKeyFailure(status: registerStatus, hotKey: launcherHotKey)
             return
         }
 
@@ -4985,10 +5242,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hasCommand: Bool,
         hasControl: Bool
     ) -> Bool {
-        keyCode == UInt16(kVK_ANSI_N) &&
-            hasOption &&
-            !hasCommand &&
-            !hasControl
+        AppPreferences.launcherHotKey.matches(
+            keyCode: keyCode,
+            hasOption: hasOption,
+            hasCommand: hasCommand,
+            hasControl: hasControl
+        )
     }
 
     private func handleHotKeyEventTapDisabled(_ type: CGEventType) {
@@ -5044,13 +5303,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItemButton(button)
     }
 
-    private func reportHotKeyFailure(status: OSStatus) {
-        fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
+    private func reportHotKeyFailure(status: OSStatus, hotKey: LauncherHotKey = AppPreferences.launcherHotKey) {
+        fputs("Failed to register \(hotKey.displayName) hotkey: \(status)\n", stderr)
         AppLog.write("hotkey_register_failed", [
-            "status": Int(status)
+            "status": Int(status),
+            "hotkey": hotKey.displayName
         ])
         statusItem?.button?.title = "Tendon!"
-        statusItem?.button?.toolTip = "Option+N could not be registered"
+        statusItem?.button?.toolTip = "\(hotKey.displayName) could not be registered"
     }
 
     @objc private func quitFromMenu() {
@@ -5065,6 +5325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             preferencesWindowController = PreferencesWindowController(
                 includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
                 launchAtLogin: LoginItemManager.isEnabled,
+                launcherHotKey: AppPreferences.launcherHotKey,
                 hiddenCandidates: AppPreferences.hiddenCandidates,
                 onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
                     AppPreferences.includeChromeBookmarks = includeChromeBookmarks
@@ -5090,6 +5351,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self?.preferencesWindowController?.syncFromPreferences()
+                },
+                onLauncherHotKeyChanged: { [weak self] launcherHotKey in
+                    self?.applyLauncherHotKeyPreference(launcherHotKey)
+                    self?.preferencesWindowController?.syncFromPreferences()
+                    AppLog.write("preferences_changed", [
+                        "launcher_hotkey": launcherHotKey.rawValue
+                    ])
                 },
                 onRestoreHiddenCandidate: { [weak self] candidate in
                     AppPreferences.restoreHiddenCandidate(candidate)
@@ -5150,7 +5418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let positionDurationMilliseconds = Self.elapsedMilliseconds(since: positionStartedAt)
 
         let presentStartedAt = Date()
-        presentLauncherWindow()
+        let didFocusSynchronously = presentAndFocusLauncherWindow(reason: "show_launcher_sync")
         let presentDurationMilliseconds = Self.elapsedMilliseconds(since: presentStartedAt)
 
         let monitorStartedAt = Date()
@@ -5171,33 +5439,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "hidden_noop_candidates": preparationResult.hiddenCounts,
             "window_visible": window?.isVisible ?? false,
             "window_key": window?.isKeyWindow ?? false,
-            "app_active": NSApp.isActive
+            "app_active": NSApp.isActive,
+            "search_focused": didFocusSynchronously
         ])
-
-        // The first presentation after launch can become visible without becoming key.
-        // Re-present on the next pass after AppKit processes activation.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else {
-                return
-            }
-
-            let asyncStartedAt = Date()
-            self.presentLauncherWindow()
-            let asyncPresentDurationMilliseconds = Self.elapsedMilliseconds(since: asyncStartedAt)
-
-            let focusStartedAt = Date()
-            self.launcherViewController.focusSearchField()
-            let focusDurationMilliseconds = Self.elapsedMilliseconds(since: focusStartedAt)
-
-            AppLog.write("show_launcher_async_timing", [
-                "present_window_ms": asyncPresentDurationMilliseconds,
-                "focus_search_field_ms": focusDurationMilliseconds,
-                "total_since_show_start_ms": Self.elapsedMilliseconds(since: startedAt),
-                "window_visible": self.window?.isVisible ?? false,
-                "window_key": self.window?.isKeyWindow ?? false,
-                "app_active": NSApp.isActive
-            ])
-        }
 
         if !didRefreshSynchronously {
             scheduleApplicationRefreshAfterPresentation(
@@ -5212,15 +5456,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         removeLauncherDismissMonitors()
     }
 
-    private func presentLauncherWindow() {
+    @discardableResult
+    private func presentAndFocusLauncherWindow(reason: String) -> Bool {
         guard let window else {
-            return
+            return false
         }
 
-        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        let frontProcessStatus = setCurrentProcessFrontmost()
+        let activated = NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        NSApp.unhide(nil)
         NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil)
+        window.makeMain()
+
+        let didFocus = launcherViewController.focusSearchField()
+        AppLog.write("launcher_focus_attempt", [
+            "reason": reason,
+            "front_process_get_status": Int(frontProcessStatus.getStatus),
+            "front_process_set_status": Int(frontProcessStatus.setStatus),
+            "running_application_activated": activated,
+            "window_visible": window.isVisible,
+            "window_key": window.isKeyWindow,
+            "window_main": window.isMainWindow,
+            "app_active": NSApp.isActive,
+            "search_focused": launcherViewController.isSearchFieldFocused(),
+            "make_first_responder_result": didFocus,
+            "frontmost_bundle_id": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil",
+            "frontmost_name": NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil"
+        ])
+
+        return didFocus && launcherViewController.isSearchFieldFocused()
+    }
+
+    private func setCurrentProcessFrontmost() -> (getStatus: OSStatus, setStatus: OSStatus) {
+        var processSerialNumber = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: 0)
+        let getStatus = OSStatus(tendonGetCurrentProcess(&processSerialNumber))
+        guard getStatus == noErr else {
+            return (getStatus, getStatus)
+        }
+
+        let setStatus = tendonSetFrontProcessWithOptions(
+            &processSerialNumber,
+            OptionBits(kSetFrontProcessCausedByUser)
+        )
+        return (getStatus, setStatus)
     }
 
     private func installLauncherDismissMonitors() {
@@ -5273,41 +5553,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func capturePreviousFrontmostWindow() {
-        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
+        guard let context = windowActivityMonitor.captureFrontmostWindow() else {
             previousFrontmostProcessIdentifier = nil
             previousFrontmostWindowTitle = nil
+            previousFrontmostWindowIdentifier = nil
             AppLog.write("capture_previous_frontmost_window", [
                 "result": "no_frontmost_application"
             ])
             return
         }
 
+        let frontmostApplication = context.application
         let processIdentifier = frontmostApplication.processIdentifier
         previousFrontmostProcessIdentifier = processIdentifier
-        previousFrontmostWindowTitle = WindowActivator.frontmostWindowTitle(for: processIdentifier)
-
-        if let previousFrontmostWindowTitle {
-            let appHistoryKey = historyKey(for: frontmostApplication)
-            let windowHistoryKey = WindowHistoryKey.make(
-                appHistoryKey: appHistoryKey,
-                title: previousFrontmostWindowTitle,
-                applicationName: frontmostApplication.localizedName
-            )
-            launchHistoryStore.recordUse(historyKey: windowHistoryKey)
-            AppLog.write("record_frontmost_window_use", [
-                "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
-                "localized_name": frontmostApplication.localizedName ?? "nil",
-                "pid": Int(processIdentifier),
-                "window_title": previousFrontmostWindowTitle,
-                "history_key": windowHistoryKey
-            ])
-        }
+        previousFrontmostWindowTitle = context.window?.title
+        previousFrontmostWindowIdentifier = context.window?.identifier
 
         AppLog.write("capture_previous_frontmost_window", [
             "pid": Int(processIdentifier),
             "localized_name": frontmostApplication.localizedName ?? "nil",
             "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
-            "window_title": previousFrontmostWindowTitle ?? "nil"
+            "window_title": previousFrontmostWindowTitle ?? "nil",
+            "window_identifier": logWindowIdentifier(previousFrontmostWindowIdentifier)
         ])
     }
 
@@ -5588,7 +5855,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func isCurrentWindow(_ app: LaunchableApp) -> Bool {
         guard
             app.targetKind == .window,
-            app.processIdentifier == previousFrontmostProcessIdentifier,
+            app.processIdentifier == previousFrontmostProcessIdentifier
+        else {
+            return false
+        }
+
+        if let identifier = app.windowIdentifier, let previousIdentifier = previousFrontmostWindowIdentifier {
+            return identifier == previousIdentifier
+        }
+
+        guard
             let windowTitle = trimmed(app.windowTitle),
             let previousTitle = trimmed(previousFrontmostWindowTitle)
         else {
@@ -5628,8 +5904,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        if app.targetKind == .webSearch {
-            launchWebSearch(app)
+        if app.targetKind == .webSearch || app.targetKind == .webURL {
+            launchWebCandidate(app)
             return
         }
 
@@ -5728,13 +6004,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func launchWebSearch(_ app: LaunchableApp) {
+    private func launchWebCandidate(_ app: LaunchableApp) {
         guard let url = app.url else {
             NSSound.beep()
             AppLog.write("launch_failed", [
                 "name": app.name,
                 "target_kind": app.targetKind.logValue,
-                "reason": "missing_web_search_url"
+                "reason": app.targetKind == .webURL ? "missing_web_url" : "missing_web_search_url"
             ])
             return
         }
@@ -5750,7 +6026,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppLog.write("launch_failed", [
                 "name": app.name,
                 "target_kind": app.targetKind.logValue,
-                "reason": "failed_to_open_web_search_url"
+                "reason": app.targetKind == .webURL ? "failed_to_open_web_url" : "failed_to_open_web_search_url"
             ])
         }
     }

@@ -10,8 +10,9 @@ Small macOS app for opening apps, windows, and bookmarks quickly.
 swift run Tendon
 ```
 
-The app lives in the menu bar as `Tendon`. Press `Option+N` to show or hide it.
-Open `Preferences...` from the menu bar item to choose whether Chrome bookmarks are included.
+The app lives in the menu bar as `Tendon`. Press `Option+N` to show or hide it by default.
+Open `Preferences...` from the menu bar item to choose the launcher shortcut and whether Chrome
+bookmarks are included.
 
 ## Package as an app bundle
 
@@ -88,12 +89,12 @@ Open, or use the "Open Anyway" button in System Settings -> Privacy & Security.
 
 ## Controls
 
-- `Option+N`: show or hide Tendon
+- `Option+N` or `Option+Space`: show or hide Tendon, depending on the selected preference
 - Type to filter candidates case-insensitively
 - `Command+A`: select all text in the search field
 - `Up` / `Down`: move selection
 - `Control+N` / `Control+P`: move selection while typing
-- `Enter`: launch the selected app
+- `Enter`: open the selected candidate
 - `Esc`: hide Tendon
 - Click an item to open it
 
@@ -107,7 +108,9 @@ Sound input and output devices are included as candidates when you type terms su
 or `sound output`. Selecting one switches the macOS default input or output device.
 Paired or recently used Bluetooth devices are included as candidates when you type terms such as
 `ble` or `bluetooth`. Selecting one connects or disconnects that device.
-When the search field is not empty, the last candidate searches Google for the entered text.
+Enter a web URL and press `Enter` to open it with the default browser. The URL candidate appears
+first; addresses without a scheme, such as `example.com`, use `https://`.
+For other nonempty input, the last candidate searches Google for the entered text.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.
 macOS may require Accessibility permission for window focusing and Screen Recording permission for
@@ -116,8 +119,10 @@ If window titles do not appear, check System Settings -> Privacy & Security and 
 allowed item is the same app bundle you are launching. Rebuilding a locally signed app can make
 macOS treat it as a new app for privacy permissions.
 
-Matching results are ranked by local launch history: most recent launch first, then launch count,
-then application name. History is stored at:
+Windows appear first, ordered by their most recent activation, including switches outside Tendon
+when Accessibility permission is granted. The current window is excluded. Windows not observed yet
+fall back to the macOS window stacking order. Other matching results are ranked by local launch
+history: most recent launch first, then launch count, then application name. History is stored at:
 
 ```text
 ~/Library/Application Support/Tendon/launch-history.json
